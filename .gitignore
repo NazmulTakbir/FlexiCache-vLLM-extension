@@ -198,8 +198,20 @@ _build/
 hip_compat.h
 
 # Benchmark dataset
+benchmarks/**/*.txt
 benchmarks/**/*.json
+benchmarks/**/*.jsonl
 
 # Linting
 actionlint
 shellcheck*/
+
+large_files/
+*/**/*.jsonl
+
+*.pt
+
+TopK-Analysis/Data
+TopK-Analysis/Data-Sorted
+
+benchmarks/language_modelling/L-Eval/LEval/
