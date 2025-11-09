@@ -96,6 +96,21 @@ class FlashAttentionMetadata:
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
 
+    # FlexiCache
+    enable_flexicache: bool = False
+    block_scores: Optional[torch.Tensor]                   = None # [num_seqs, num_kv_heads, max_num_blocks_per_seq_per_head]
+    num_decode_step: Optional[torch.Tensor]                = None # [num_seqs] 
+    max_filtered_blocks: Optional[int]                     = None
+    rank_frequency: Optional[int]                          = None
+    minmax_block_table: Optional[torch.Tensor]             = None # [num_seqs, num_kv_heads, max_num_blocks_per_seq_per_head]
+    minmax_key_cache: Optional[torch.Tensor]               = None # [num_layers, num_blocks, 2, head_size]
+    top_k_blocks: Optional[torch.Tensor]                   = None # [num_layers, num_reqs, num_kv_heads, max_filtered_blocks]
+    old_top_k_blocks: Optional[torch.Tensor]               = None # [num_layers, num_reqs, num_kv_heads, max_filtered_blocks]
+    needs_rerank_gpu: Optional[torch.Tensor]               = None # [<=num_seqs]
+    any_needs_rerank: Optional[bool]                       = None
+    is_first_decode_gpu: Optional[torch.Tensor]            = None # [<=num_reqs]
+    any_first_decode: Optional[bool]                       = None
+    last_ranked_num_blks: Optional[torch.Tensor]           = None # [num_seqs]
 
 class FlashAttentionMetadataBuilder:
 
@@ -107,16 +122,37 @@ class FlashAttentionMetadataBuilder:
         return False
 
     def build(self, num_reqs: int, num_actual_tokens: int, max_query_len: int,
-              common_prefix_len: int):
+              common_prefix_len: int,
+              enable_flexicache: bool                                = False,
+              block_scores: Optional[torch.Tensor]                   = None,
+              num_decode_step: Optional[torch.Tensor]                = None,
+              max_filtered_blocks: Optional[int]                     = None,
+              rank_frequency: Optional[int]                          = None,
+              top_k_blocks: Optional[torch.Tensor]                   = None,
+              old_top_k_blocks: Optional[torch.Tensor]               = None,
+              needs_rerank_gpu: Optional[torch.Tensor]               = None,
+              is_first_decode_gpu: Optional[torch.Tensor]            = None,
+              last_ranked_num_blks: Optional[torch.Tensor]           = None):
         max_seq_len = self.runner.seq_lens_np[:num_reqs].max()
         query_start_loc = self.runner.query_start_loc_cpu[:num_reqs + 1].to(
             self.runner.device, non_blocking=True)
         seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(self.runner.device,
                                                           non_blocking=True)
-        block_table = (
-            self.runner.input_batch.block_table.get_device_tensor()[:num_reqs])
-        slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
-            self.runner.device, non_blocking=True).long()
+        
+        if self.runner.enable_flexicache:
+            block_table = (
+                self.runner.input_batch.block_table.get_device_tensor()[:num_reqs])
+            minmax_block_table = (
+                self.runner.input_batch.minmax_block_table.get_device_tensor()[:num_reqs])
+            minmax_key_cache = self.runner.minmax_key_cache
+            slot_mapping = self.runner.slot_mapping_gpu[:, :num_actual_tokens]
+        else:
+            block_table = (
+                self.runner.input_batch.block_table.get_device_tensor()[:num_reqs])
+            minmax_block_table = None
+            minmax_key_cache = None
+            slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
+                self.runner.device, non_blocking=True).long()
 
         use_cascade = common_prefix_len > 0
         if use_cascade:
@@ -149,6 +185,20 @@ class FlashAttentionMetadataBuilder:
             cu_prefix_query_lens=cu_prefix_query_lens,
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
+            enable_flexicache=enable_flexicache,
+            block_scores=block_scores,
+            num_decode_step=num_decode_step,
+            max_filtered_blocks=max_filtered_blocks,
+            rank_frequency=rank_frequency,
+            minmax_block_table=minmax_block_table,
+            minmax_key_cache=minmax_key_cache,
+            top_k_blocks=top_k_blocks,
+            old_top_k_blocks=old_top_k_blocks,
+            needs_rerank_gpu=needs_rerank_gpu,
+            any_needs_rerank=needs_rerank_gpu is not None and len(needs_rerank_gpu) > 0,
+            last_ranked_num_blks=last_ranked_num_blks,
+            is_first_decode_gpu=is_first_decode_gpu,
+            any_first_decode=is_first_decode_gpu is not None and len(is_first_decode_gpu) > 0,
         )
         return attn_metadata
 

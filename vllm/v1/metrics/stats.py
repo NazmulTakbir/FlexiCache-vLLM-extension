@@ -30,7 +30,13 @@ class SchedulerStats:
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
 
-    gpu_cache_usage: float = 0.0
+    gpu_cache_min_usage: float = 0.0
+    cpu_cache_min_usage: float = 0.0
+    gpu_cache_max_usage: float = 0.0
+    cpu_cache_max_usage: float = 0.0
+
+    gpu_min_usage_layer_id: int = 0
+    gpu_max_usage_layer_id: int = 0
 
     prefix_cache_stats: PrefixCacheStats = field(
         default_factory=PrefixCacheStats)

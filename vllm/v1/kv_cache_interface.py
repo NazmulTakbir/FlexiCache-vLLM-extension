@@ -6,6 +6,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.utils import cdiv, get_dtype_size
+from vllm.v1.flexicache.config import FlexiCacheConfig
 
 logger = init_logger(__name__)
 
@@ -42,6 +43,16 @@ class KVCacheSpec:
             The page size
         """
         raise NotImplementedError
+    
+    @property
+    def minmax_page_size_bytes(self) -> int:
+        """
+        The size of a minmax page in bytes.
+
+        Returns:
+            The minmax page size
+        """
+        raise NotImplementedError
 
     def bytes_for_tokens(self, num_tokens: int) -> int:
         """
@@ -60,20 +71,33 @@ class FullAttentionSpec(KVCacheSpec):
     head_size: int
     dtype: torch.dtype
     use_mla: bool
+    enable_flexicache: bool = False
 
     @property
     def type_id(self) -> str:
-        return f"full_attention_{self.block_size}_{self.page_size_bytes}"
-
+        prefix = "flexicache" if self.enable_flexicache else "full_attention"
+        return f"{prefix}_{self.block_size}_{self.page_size_bytes}"
+    
     @property
     def page_size_bytes(self) -> int:
-        # For MLA we only store a single latent vector
-        coef = 1 if self.use_mla else 2
-        return coef * self.block_size * self.num_kv_heads * self.head_size \
-                * get_dtype_size(self.dtype)
+        if self.enable_flexicache:
+            return 2 * self.block_size * self.head_size * get_dtype_size(self.dtype)
+        else:
+            # For MLA we only store a single latent vector
+            coef = 1 if self.use_mla else 2
+            return coef * self.block_size * self.num_kv_heads * self.head_size \
+                    * get_dtype_size(self.dtype)
+        
+    @property
+    def minmax_page_size_bytes(self) -> int:
+        assert self.enable_flexicache
+        return FlexiCacheConfig.minmax_key_cache_block_size * 2 * self.head_size * get_dtype_size(self.dtype)
 
     def bytes_for_tokens(self, num_tokens: int) -> int:
-        return cdiv(num_tokens, self.block_size) * self.page_size_bytes
+        if self.enable_flexicache:
+            return cdiv(num_tokens, self.block_size) * self.num_kv_heads * self.page_size_bytes
+        else:
+            return cdiv(num_tokens, self.block_size) * self.page_size_bytes
 
 
 @dataclass
@@ -105,7 +129,6 @@ class KVCacheConfig:
     """
     """The number of KV cache blocks"""
     num_blocks: int
-    """layer_name -> how to initialize KV cache for that layer"""
     tensors: dict[str, KVCacheTensor]
     """
     The kv cache groups of the model.
@@ -129,3 +152,18 @@ class KVCacheConfig:
     there are 3 groups, each of which represents 10 layers in the model.
     """
     kv_cache_groups: list[KVCacheGroupSpec]
+
+    """
+    For FlexiCache, `num_blocks`, `num_cpu_blocks`, and `num_minmax_blocks` are the total number
+    of gpu blocks, cpu blocks, and minmax blocks. The total number of blocks are not distributed
+    evenly across all layers or heads.
+    The size of each tensor determines the number of blocks allocated to each layer.
+    Heads within the same layer are allocated blocks from the same pool of blocks for that layer.
+    """
+    """The number of KV cache CPU blocks"""
+    num_cpu_blocks: int  = 0
+    """The number of KV cache minmax blocks"""
+    num_minmax_blocks: int = 0
+    """layer_name -> how to initialize KV cache for that layer"""
+    cpu_tensors: dict[str, KVCacheTensor] | None = None
+    minmax_tensors: dict[str, KVCacheTensor] | None = None

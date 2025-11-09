@@ -51,9 +51,14 @@ async def generate(request: Request) -> Response:
     request_dict = await request.json()
     return await _generate(request_dict, raw_request=request)
 
+# --- FOR RULER compatibility: accept PUT as well ---
+@app.put("/generate")
+async def generate_put(request: Request) -> Response:
+    return await _generate(await request.json(), raw_request=request, include_prompt=False)
+
 
 @with_cancellation
-async def _generate(request_dict: dict, raw_request: Request) -> Response:
+async def _generate(request_dict: dict, raw_request: Request, include_prompt=True) -> Response:
     prompt = request_dict.pop("prompt")
     stream = request_dict.pop("stream", False)
     sampling_params = SamplingParams(**request_dict)
@@ -67,9 +72,11 @@ async def _generate(request_dict: dict, raw_request: Request) -> Response:
         async for request_output in results_generator:
             prompt = request_output.prompt
             assert prompt is not None
-            text_outputs = [
-                prompt + output.text for output in request_output.outputs
-            ]
+            if include_prompt:
+                text_outputs = [prompt + output.text for output in request_output.outputs]
+            else:
+                # RULER compatibility: do not include prompt in the output
+                text_outputs = [output.text for output in request_output.outputs]
             ret = {"text": text_outputs}
             yield (json.dumps(ret) + "\n").encode("utf-8")
 
@@ -87,7 +94,11 @@ async def _generate(request_dict: dict, raw_request: Request) -> Response:
     assert final_output is not None
     prompt = final_output.prompt
     assert prompt is not None
-    text_outputs = [prompt + output.text for output in final_output.outputs]
+    if include_prompt:
+        text_outputs = [prompt + output.text for output in final_output.outputs]
+    else:
+        # RULER compatibility: do not include prompt in the output
+        text_outputs = [output.text for output in final_output.outputs]
     ret = {"text": text_outputs}
     return JSONResponse(ret)
 

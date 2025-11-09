@@ -102,6 +102,11 @@ class LLM:
             requests will have `best_of=1`, you can safely set this to 0.
             Noting that `best_of` is only supported in V0. Otherwise, too small
             values may cause out-of-memory (OOM) errors.
+        enable_flexicache: Whether to enable enable_flexicache
+        num_unstable_heads: Number of unstable heads for FlexiCache.
+        rerank_frequency: Frequency of re-ranking for FlexiCache.
+        topK_budget: Top K budget for FlexiCache.
+        unstable_heads_profile_task: Task which was used to profile unstable heads for FlexiCache.
         cpu_offload_gb: The size (GiB) of CPU memory to use for offloading
             the model weights. This virtually increases the GPU memory space
             you can use to hold the model weights, at the cost of CPU-GPU data
@@ -172,6 +177,11 @@ class LLM:
         seed: Optional[int] = None,
         gpu_memory_utilization: float = 0.9,
         swap_space: float = 4,
+        enable_flexicache: bool = False,
+        num_unstable_heads: int = -1,
+        rerank_frequency: int = -1,
+        topK_budget: int = -1,
+        unstable_heads_profile_task: str = None,
         cpu_offload_gb: float = 0,
         enforce_eager: Optional[bool] = None,
         max_seq_len_to_capture: int = 8192,
@@ -227,6 +237,11 @@ class LLM:
             seed=seed,
             gpu_memory_utilization=gpu_memory_utilization,
             swap_space=swap_space,
+            enable_flexicache=enable_flexicache,
+            num_unstable_heads=num_unstable_heads,
+            rerank_frequency=rerank_frequency,
+            topK_budget=topK_budget,
+            unstable_heads_profile_task=unstable_heads_profile_task,
             cpu_offload_gb=cpu_offload_gb,
             enforce_eager=enforce_eager,
             max_seq_len_to_capture=max_seq_len_to_capture,

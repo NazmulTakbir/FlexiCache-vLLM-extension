@@ -34,6 +34,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
+from vllm.v1.flexicache.config import FlexiCacheConfig
 
 logger = init_logger(__name__)
 
@@ -56,14 +57,31 @@ class EngineCore:
 
         self.log_stats = log_stats
 
+        if vllm_config.cache_config.enable_flexicache:
+            FlexiCacheConfig.initialize(
+                model_name=vllm_config.model_config.model,
+                num_layers=vllm_config.model_config.get_num_layers(vllm_config.parallel_config),
+                num_kv_heads=vllm_config.model_config.get_total_num_kv_heads(),
+                block_size=vllm_config.cache_config.block_size,
+                num_unstable_heads=vllm_config.cache_config.num_unstable_heads,
+                rerank_frequency=vllm_config.cache_config.rerank_frequency,
+                topK_budget=vllm_config.cache_config.topK_budget,
+                max_model_len=vllm_config.model_config.max_model_len,
+                unstable_heads_profile_task=vllm_config.cache_config.unstable_heads_profile_task
+            )
+
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
 
         # Setup KV Caches and update CacheConfig after profiling.
-        num_gpu_blocks, num_cpu_blocks = self._initialize_kv_caches(
+        num_gpu_blocks, num_minmax_blocks, num_cpu_blocks = self._initialize_kv_caches(
             vllm_config)
-        vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
-        vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+        
+        # NB: For flexicache, `num_*_blocks` refers to the total number of blocks
+        # that can be allocated. This allocation is not uniform across layers and heads
+        vllm_config.cache_config.num_gpu_blocks    = num_gpu_blocks
+        vllm_config.cache_config.num_minmax_blocks = num_minmax_blocks
+        vllm_config.cache_config.num_cpu_blocks    = num_cpu_blocks
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
@@ -92,6 +110,7 @@ class EngineCore:
             speculative_config=vllm_config.speculative_config,
             log_stats=self.log_stats,
             structured_output_manager=self.structured_output_manager,
+            parallel_config=vllm_config.parallel_config,
         )
 
         # Setup MM Input Mapper.
@@ -121,11 +140,18 @@ class EngineCore:
         # memory can be allocated for kv cache.
         available_gpu_memory = self.model_executor.determine_available_memory()
 
+        if vllm_config.cache_config.enable_flexicache:
+            mem_portion_for_kv = \
+                1 - FlexiCacheConfig.mem_portion_for_minmax_key_cache(vllm_config.cache_config.block_size)
+        else:
+            mem_portion_for_kv = 1
+        assert 0.0 < mem_portion_for_kv <= 1.0
+
         assert len(kv_cache_specs) == len(available_gpu_memory)
         # Get the kv cache tensor size
         kv_cache_configs = [
             get_kv_cache_config(vllm_config, kv_cache_spec_one_worker,
-                                available_gpu_memory_one_worker)
+                                available_gpu_memory_one_worker, mem_portion_for_kv)
             for kv_cache_spec_one_worker, available_gpu_memory_one_worker in
             zip(kv_cache_specs, available_gpu_memory)
         ]
@@ -139,10 +165,12 @@ class EngineCore:
         # an arbitrary one to get the number of blocks.
         assert all([
             cfg.num_blocks == kv_cache_configs[0].num_blocks
+            and cfg.num_cpu_blocks == kv_cache_configs[0].num_cpu_blocks
             for cfg in kv_cache_configs
         ])
         num_gpu_blocks = kv_cache_configs[0].num_blocks
-        num_cpu_blocks = 0
+        num_minmax_blocks = kv_cache_configs[0].num_minmax_blocks
+        num_cpu_blocks = kv_cache_configs[0].num_cpu_blocks
 
         # Initialize kv cache and warmup the execution
         self.model_executor.initialize_from_config(kv_cache_configs)
@@ -150,7 +178,7 @@ class EngineCore:
         elapsed = time.time() - start
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
-        return num_gpu_blocks, num_cpu_blocks
+        return num_gpu_blocks, num_minmax_blocks, num_cpu_blocks
 
     def add_request(self, request: EngineCoreRequest):
         """Add request to the scheduler."""

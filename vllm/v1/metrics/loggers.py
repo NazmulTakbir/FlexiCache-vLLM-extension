@@ -77,18 +77,37 @@ class LoggingStatLogger(StatLoggerBase):
         scheduler_stats = self.last_scheduler_stats
 
         # Format and print output.
+        # logger.info(
+        #     "Avg prompt throughput: %.1f tokens/s, "
+        #     "Avg generation throughput: %.1f tokens/s, "
+        #     "Running: %d reqs, Waiting: %d reqs, "
+        #     "GPU KV cache usage: %.1f%%, "
+        #     "Prefix cache hit rate: %.1f%%",
+        #     prompt_throughput,
+        #     generation_throughput,
+        #     scheduler_stats.num_running_reqs,
+        #     scheduler_stats.num_waiting_reqs,
+        #     scheduler_stats.gpu_cache_usage * 100,
+        #     self.prefix_caching_metrics.hit_rate * 100,
+        # )
         logger.info(
-            "Avg prompt throughput: %.1f tokens/s, "
-            "Avg generation throughput: %.1f tokens/s, "
+            "Prefill Speed: %.1f tokens/s, "
+            "Gen Speed: %.1f tokens/s, "
             "Running: %d reqs, Waiting: %d reqs, "
-            "GPU KV cache usage: %.1f%%, "
-            "Prefix cache hit rate: %.1f%%",
+            "GPU KVC Min usage: %.1f%% (%d), "
+            "GPU KVC Max usage: %.1f%% (%d), "
+            "CPU KVC Min usage: %.1f%%, "
+            "CPU KVC Max usage: %.1f%%",
             prompt_throughput,
             generation_throughput,
             scheduler_stats.num_running_reqs,
             scheduler_stats.num_waiting_reqs,
-            scheduler_stats.gpu_cache_usage * 100,
-            self.prefix_caching_metrics.hit_rate * 100,
+            scheduler_stats.gpu_cache_min_usage * 100,
+            scheduler_stats.gpu_min_usage_layer_id,
+            scheduler_stats.gpu_cache_max_usage * 100,
+            scheduler_stats.gpu_max_usage_layer_id,
+            scheduler_stats.cpu_cache_min_usage * 100,
+            scheduler_stats.cpu_cache_max_usage * 100,
         )
 
 
@@ -325,7 +344,7 @@ class PrometheusStatLogger(StatLoggerBase):
         self.gauge_scheduler_running.set(scheduler_stats.num_running_reqs)
         self.gauge_scheduler_waiting.set(scheduler_stats.num_waiting_reqs)
 
-        self.gauge_gpu_cache_usage.set(scheduler_stats.gpu_cache_usage)
+        self.gauge_gpu_cache_usage.set(scheduler_stats.gpu_cache_max_usage)
 
         self.counter_gpu_prefix_cache_queries.inc(
             scheduler_stats.prefix_cache_stats.queries)

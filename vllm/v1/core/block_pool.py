@@ -26,9 +26,11 @@ class BlockPool:
         enable_caching: Whether to enable prefix caching.
     """
 
-    def __init__(self, num_gpu_blocks: int, enable_caching: bool):
+    def __init__(self, num_gpu_blocks: int, enable_caching: bool, enable_flexicache: bool, num_kv_head: int, num_cpu_blocks: int = 0):
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
+        self.enable_flexicache = enable_flexicache
+        self.num_kv_head = num_kv_head
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -37,6 +39,14 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+
+        if enable_flexicache:
+            self.num_cpu_blocks = num_cpu_blocks
+            self.cpu_blocks: list[KVCacheBlock] = [
+                KVCacheBlock(idx) for idx in range(num_cpu_blocks)
+            ]
+            self.free_cpu_block_queue = \
+                FreeKVCacheBlockQueue(self.cpu_blocks, only_null_block=num_cpu_blocks==0)
 
         # {block_hash: {block ID: block}}. A cached block is
         # a full block with a block hash that can be used for prefix caching.
@@ -147,6 +157,9 @@ class BlockPool:
             self.cached_block_hash_to_block[block_hash][blk.block_id] = blk
             prev_block_hash_value = block_hash.hash_value
 
+    def get_new_blocks_cpu(self, num_blocks: int, unstable_heads: set[int]) -> list[KVCacheBlock]:
+        return self.free_cpu_block_queue.pop_left_many_with_null(num_blocks, self.num_kv_head, unstable_heads)
+
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -162,22 +175,32 @@ class BlockPool:
             raise ValueError(
                 f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = []
-        idx = 0
-        while idx < num_blocks:
-            # First allocate blocks.
-            curr_block = self.free_block_queue.popleft()
-            assert curr_block.ref_cnt == 0
+        if self.enable_flexicache:
+            return self.free_block_queue.pop_left_many(num_blocks)
+        else:
+            ret: list[KVCacheBlock] = []
+            idx = 0
+            while idx < num_blocks:
+                # First allocate blocks.
+                curr_block = self.free_block_queue.popleft()
+                assert curr_block.ref_cnt == 0
 
-            # If the block is cached, evict it.
-            if self.enable_caching:
-                self._maybe_evict_cached_block(curr_block)
+                # If the block is cached, evict it.
+                if self.enable_caching:
+                    self._maybe_evict_cached_block(curr_block)
 
-            curr_block.incr_ref()
-            ret.append(curr_block)
-            idx += 1
+                curr_block.incr_ref()
+                ret.append(curr_block)
+                idx += 1
 
-        return ret
+            return ret
+
+    def get_new_cpu_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        if num_blocks > self.get_num_free_cpu_blocks():
+            raise ValueError(
+                f"Cannot get {num_blocks} free blocks from the cpu pool")
+
+        return self.free_cpu_block_queue.pop_left_many(num_blocks)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -216,7 +239,7 @@ class BlockPool:
                 self.free_block_queue.remove(block)
             block.incr_ref()
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock], guard_check: bool = True) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
@@ -224,10 +247,19 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
-        for block in ordered_blocks:
-            block.decr_ref()
-            if block.ref_cnt == 0:
-                self.free_block_queue.append(block)
+        if self.enable_flexicache:
+            if guard_check:
+                ordered_blocks = [b for b in ordered_blocks if b.block_id != -1]
+            self.free_block_queue.append_many(ordered_blocks)
+        else:
+            for block in ordered_blocks:
+                block.decr_ref()
+                if block.ref_cnt == 0:
+                    self.free_block_queue.append(block)
+
+    def free_cpu_blocks(self, blocks: Iterable[KVCacheBlock]) -> None:
+        blocks = [b for b in blocks if b.block_id != -1]
+        self.free_cpu_block_queue.append_many(blocks)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -270,3 +302,38 @@ class BlockPool:
             The KV cache usage (between 0.0 and 1.0).
         """
         return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
+    
+    def get_cpu_usage(self) -> float:
+        """Get the KV cache usage.
+
+        Returns:
+            The KV cache usage (between 0.0 and 1.0).
+        """
+        return 1.0 - (self.get_num_free_cpu_blocks() / self.num_cpu_blocks)
+
+    def get_num_free_cpu_blocks(self) -> int:
+        """Get the number of free cpu blocks in the pool.
+
+        Returns:
+            The number of free cpu blocks.
+        """
+        return self.free_cpu_block_queue.num_free_blocks
+
+class MinMaxBlockPool:
+    """Pool for MinMax pages that mirrors BlockPool's free-list behavior but
+    without cached hashes or sharing semantics."""
+    def __init__(self, num_blocks: int):
+        self.num_blocks = num_blocks
+        self.blocks: list[KVCacheBlock] = [KVCacheBlock(i) for i in range(num_blocks)]
+        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+
+    def get_new_blocks(self, n: int) -> list[KVCacheBlock]:
+        if n > self.free_block_queue.num_free_blocks:
+            raise ValueError(f"Cannot allocate {n} minmax blocks")
+        return self.free_block_queue.pop_left_many(n)
+
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        self.free_block_queue.append_many(ordered_blocks)
+
+    def get_num_free_blocks(self) -> int:
+        return self.free_block_queue.num_free_blocks

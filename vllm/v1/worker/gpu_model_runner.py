@@ -2,13 +2,18 @@
 
 import gc
 import time
+import math
+import os
+import importlib.util
 import weakref
 from typing import TYPE_CHECKING, Optional, Union
+from collections import deque
 
 import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+from torch.utils.cpp_extension import load as load_ext
 
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
@@ -39,8 +44,13 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.utils import is_spec_decode_supported
 from vllm.v1.utils import bind_kv_cache
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch, PausedInputs
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+import vllm.v1.flexicache.config as FCC
+from vllm.v1.flexicache.config import FlexiCacheConfig
+from vllm.attention.ops.flexi_cache_triton_kernels import (
+    store_minmax_key_cache_for_prefill, store_minmax_key_cache_for_decode, slot_map_kernel
+)
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -58,6 +68,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
+        main_stream: torch.cuda.Stream,
+        hi_priority: int,
+        low_priority: int
     ):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -94,9 +107,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_multimodal_model = model_config.is_multimodal_model
         self.block_size = cache_config.block_size
         self.max_model_len = model_config.max_model_len
-        self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
+        self.max_logical_blks_per_req = cdiv(self.max_model_len, self.block_size)
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
+
+        self.enable_flexicache = cache_config.enable_flexicache
 
         # Model-related.
         self.num_attn_layers = model_config.get_num_layers_by_block_type(
@@ -143,9 +158,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Lazy initialization
         # self.model: nn.Module  # Set after load_model
-        self.kv_caches: list[torch.Tensor] = []
+        self.kv_caches: list[torch.Tensor]     = []
+        self.cpu_kv_caches: list[torch.Tensor] = []
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: dict[str, dict[int, torch.Tensor]] = {}
+
+        self.minmax_key_cache: torch.Tensor = None
 
         # Set up speculative decoding.
         self.use_spec_decode = False
@@ -165,16 +183,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 self.rejection_sampler = RejectionSampler()
 
+        if self.enable_flexicache:
+            self.max_filtered_blocks = FlexiCacheConfig.top_k_page_budget
+            self.rank_frequency      = FlexiCacheConfig.rerank_frequency
+            slot_mapping_shape = (self.num_attn_layers, self.max_num_tokens, self.num_kv_heads)
+            slot_mapping_dtype = torch.int64
+        else:
+            slot_mapping_shape = (self.max_num_tokens,)
+            slot_mapping_dtype = torch.int32
+
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
         # Persistent batch.
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
-            max_num_blocks_per_req=self.max_num_blocks_per_req,
+            max_logical_blks_per_req=self.max_logical_blks_per_req,
             device=self.device,
             pin_memory=self.pin_memory,
             vocab_size=model_config.get_vocab_size(),
+            enable_flexicache=self.enable_flexicache,
+            num_kv_heads=self.num_kv_heads,
+            num_query_heads=self.num_query_heads,
+            max_filtered_blocks=self.max_filtered_blocks if self.enable_flexicache else -1,
+            num_attn_layers=self.num_attn_layers,
+            block_size=self.block_size,
         )
 
         self.use_cuda_graph = (self.vllm_config.compilation_config.level
@@ -199,6 +232,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.positions = torch.zeros(self.max_num_tokens,
                                      dtype=torch.int64,
                                      device=self.device)
+        self.logical_indices = torch.zeros(self.max_num_tokens,
+                                           dtype=torch.int32,
+                                           device=self.device)
+        self.offsets = torch.zeros(self.max_num_tokens,
+                                   dtype=torch.int32,
+                                   device=self.device)
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: Optional[IntermediateTensors] = None
 
@@ -246,11 +285,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                          device="cpu",
                                          pin_memory=self.pin_memory)
         self.positions_np = self.positions_cpu.numpy()
-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
-                                            dtype=torch.int32,
+        self.slot_mapping_cpu = torch.zeros(slot_mapping_shape,
+                                            dtype=slot_mapping_dtype,
                                             device="cpu",
                                             pin_memory=self.pin_memory)
         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+        self.slot_mapping_gpu = torch.zeros(slot_mapping_shape,
+                                            dtype=slot_mapping_dtype,
+                                            device=self.device)
         self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
                                                dtype=torch.int32,
                                                device="cpu",
@@ -261,6 +303,98 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                         device="cpu",
                                         pin_memory=self.pin_memory)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
+
+        if self.enable_flexicache:
+            self.main_stream = main_stream
+            self.background_stream: torch.cuda.Stream = torch.cuda.Stream(device=self.device, priority=low_priority)
+            self.gpu_kv_cache_pool: Optional[torch.Tensor]   = None   # (2, total_blocks_across_layers, block_size, head_size)
+            self.gpu_layer_first_blk: Optional[torch.Tensor] = None   # [L] int64
+            self.gpu_layer_nblk: Optional[torch.Tensor]      = None   # [L] int32
+
+            self.cpu_kv_cache_pool: Optional[torch.Tensor]   = None   # (2, cpu_total_blocks_across_layers, block_size, head_size)
+            self.cpu_layer_first_blk: Optional[torch.Tensor] = None   # [L] int64
+            self.cpu_layer_nblk: Optional[torch.Tensor]      = None   # [L] int32
+
+            self.layer_gpu_offsets: Optional[torch.Tensor] = None   # [L+1] int64
+            self.layer_cpu_offsets: Optional[torch.Tensor] = None   # [L+1] int64
+
+            flexicache_cuda = importlib.util.find_spec("vllm.v1.flexicache.kernels.cuda")
+            assert flexicache_cuda is not None, "vllm.v1.flexicache.kernels.cuda not found"
+            base_path = os.path.dirname(flexicache_cuda.origin)
+
+            bt_tx_path = os.path.join(base_path, "block_table_h2d_dirty.cu")
+            self._bt_tx = load_ext(
+                name="block_table_h2d_dirty",
+                sources=[bt_tx_path],
+                extra_cuda_cflags=["-O3"],
+                extra_cflags=["-O3"],
+                verbose=False,
+            )
+
+            kv_d2h_tx_path = os.path.join(base_path, "kv_d2h_tx_gpu_mapped.cu")
+            self._kv_d2h_tx = load_ext(
+                name="kv_d2h_tx_gpu_mapped",
+                sources=[kv_d2h_tx_path],
+                extra_cuda_cflags=["-O3"],
+                extra_cflags=["-O3"],
+                verbose=False,
+            )
+
+            kv_h2d_tx_path = os.path.join(base_path, "h2d_copy_blocks.cu")
+            self._kv_h2d_tx = load_ext(
+                name="h2d_copy_blocks",
+                sources=[kv_h2d_tx_path],
+                extra_cuda_cflags=["-O3"],
+                extra_cflags=["-O3"],
+                verbose=False,
+            )
+
+            topk_swap_map_path = os.path.join(base_path, "topk_swap_map.cu")
+            self._topk_swap_map = load_ext(
+                name="topk_swap_map",
+                sources=[topk_swap_map_path],
+                extra_cuda_cflags=["-O3"],
+                extra_cflags=["-O3"],
+                verbose=False,
+            )
+
+            # Small persistent scratch for the tiny dirty-range tensors
+            self._dirty_gpu_kv  = torch.empty((self.max_num_reqs, 2), dtype=torch.int32, device=self.device)
+            self._dirty_cpu_kv  = torch.empty((self.max_num_reqs, 2), dtype=torch.int32, device=self.device)
+            self._dirty_gpu_mmb = torch.empty((self.max_num_reqs, 2), dtype=torch.int32, device=self.device)
+
+            self._kv_reload_queue: deque[tuple[str, torch.cuda.Event]] = deque()
+
+            self.needs_rerank: list[int]    = []
+            self.is_first_decode: list[int] = []
+            self.resumed_from_preemption: set[str] = set()
+
+            self._idx_prefill = np.empty(self.max_num_reqs, dtype=np.int32)
+            self._idx_decode  = np.empty(self.max_num_reqs, dtype=np.int32)
+            self._idx_d2h     = np.empty(self.max_num_reqs, dtype=np.int32)
+            self._idx_first   = np.empty(self.max_num_reqs, dtype=np.int32)
+            self._idx_rerank  = np.empty(self.max_num_reqs, dtype=np.int32)
+
+            self._prompt_buf  = np.empty(self.max_num_reqs, dtype=np.int32)  # per-selected prefill prompts
+            self._page_buf    = np.empty(self.max_num_reqs, dtype=np.int32)  # per-selected decode new-page
+
+            self.paused_inputs = PausedInputs(
+                max_paused_reqs          = self.max_num_reqs,
+                device                   = self.device,
+                enable_flexicache        = self.enable_flexicache,
+                num_kv_heads             = self.num_kv_heads,
+                max_filtered_blocks      = self.max_filtered_blocks,
+                num_attn_layers          = self.num_attn_layers,
+                max_logical_blks_per_req = self.max_logical_blks_per_req,
+                max_model_len            = self.max_model_len,
+                block_size               = self.block_size
+            )
+
+            self._prompt_offload_queue: deque[tuple[str, torch.cuda.Event]] = deque()
+
+            assert FCC.IS_INITIALIZED, "FlexiCacheConfig is not initialized properly."
+            self.minmax_key_cache_block_size = FCC.MINMAX_KEY_CACHE_BLOCK_SIZE
+            self.unstable_head_masks         = FCC.UNSTABLE_HEAD_MASKS
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -276,6 +410,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.encoder_cache.pop(req_id, None)
+
+        if self.enable_flexicache:
+            need_to_discard = (
+                (scheduler_output.preempted_req_ids | scheduler_output.finished_req_ids)
+                & set(self.paused_inputs.req_to_slot.keys())
+            )
+            if need_to_discard:
+                self.background_stream.synchronize()
+                for req_id in need_to_discard:
+                    self.paused_inputs.discard(req_id)
+            self.resumed_from_preemption.clear()
+
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -309,6 +455,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
         for req_id in unscheduled_req_ids:
+            if self.enable_flexicache and req_id not in scheduler_output.preempted_req_ids:
+                self.paused_inputs.save(req_id, self.input_batch)
             req_index = self.input_batch.remove_request(req_id)
             assert req_index is not None
             removed_req_indices.append(req_index)
@@ -332,7 +480,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_positions=new_req_data.mm_positions,
                 sampling_params=sampling_params,
                 generator=generator,
-                block_ids=new_req_data.block_ids,
+                block_ids_by_layer=new_req_data.block_ids_by_layer,
+                cpu_block_ids_by_layer=new_req_data.cpu_block_ids_by_layer,
+                minmax_block_ids_by_layer=new_req_data.minmax_block_ids_by_layer,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
@@ -390,11 +540,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Update the block IDs.
             if not req_data.resumed_from_preemption:
                 # Append the new blocks to the existing block IDs.
-                req_state.block_ids.extend(req_data.new_block_ids)
+                if self.enable_flexicache:
+                    for l in range(self.num_attn_layers):
+                        new_blocks     = req_data.new_block_ids_by_layer[l]
+                        new_minmax     = req_data.new_minmax_block_ids_by_layer[l]
+                        new_cpu_blocks = req_data.new_cpu_block_ids_by_layer[l]
+
+                        if new_blocks:
+                            req_state.block_ids_by_layer[l].extend(new_blocks)
+                        if new_minmax:
+                            req_state.minmax_block_ids_by_layer[l].extend(new_minmax)
+                        if new_cpu_blocks:
+                            req_state.cpu_block_ids_by_layer[l].extend(new_cpu_blocks)
+                else:
+                    req_state.block_ids_by_layer[0].extend(req_data.new_block_ids_by_layer[0])
             else:
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
-                req_state.block_ids = req_data.new_block_ids
+                if self.enable_flexicache:
+                    self.resumed_from_preemption.add(req_id)
+                    for l in range(self.num_attn_layers):
+                        req_state.block_ids_by_layer[l]        = req_data.new_block_ids_by_layer[l]
+                        req_state.minmax_block_ids_by_layer[l] = req_data.new_minmax_block_ids_by_layer[l]
+                        req_state.cpu_block_ids_by_layer[l]    = req_data.new_cpu_block_ids_by_layer[l]
+                else:
+                    req_state.block_ids_by_layer[0] = req_data.new_block_ids_by_layer[0]
 
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
@@ -407,8 +577,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = (
                 num_computed_tokens)
-            self.input_batch.block_table.append_row(req_data.new_block_ids,
-                                                    req_index)
+            self.input_batch.block_table.append_row(
+                req_data.new_block_ids_by_layer, req_index
+            )
+            if self.enable_flexicache:
+                self.input_batch.minmax_block_table.append_row(
+                    req_data.new_minmax_block_ids_by_layer, req_index
+                )
+                self.input_batch.cpu_block_table.append_row(
+                    req_data.new_cpu_block_ids_by_layer, req_index
+                )
             # Add new_token_ids to token_ids_cpu.
             start_token_index = num_computed_tokens
             end_token_index = num_computed_tokens + len(req_data.new_token_ids)
@@ -442,11 +620,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 # Append to the end.
                 req_index = None
-            self.input_batch.add_request(req_state, req_index)
+            if self.enable_flexicache:
+                is_paused = self.paused_inputs.is_paused(req_id)
+                self.input_batch.add_request(req_state, req_index, is_paused)
+                if is_paused:
+                    self.paused_inputs.restore(req_id, self.input_batch, req_state)
+            else:
+                self.input_batch.add_request(req_state, req_index)
 
         # Condense the batched states if there are empty indices.
         if removed_req_indices:
-            self.input_batch.condense(removed_req_indices)
+            self.input_batch.condense(removed_req_indices, scheduler_output)
 
         if batch_changed:
             self.input_batch.refresh_sampling_metadata()
@@ -471,17 +655,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit(num_reqs)
+        if self.enable_flexicache:
+            self.commit_block_table(num_reqs)
+            self.input_batch.block_scores[:, :num_reqs, :, :].fill_(float('-inf'))
+        else:
+            self.input_batch.block_table.commit(num_reqs)
 
         # Get the number of scheduled tokens for each request.
         # TODO: The Python loop can be slow. Optimize.
         num_scheduled_tokens = np.empty(num_reqs, dtype=np.int32)
         max_num_scheduled_tokens = 0
+
+        if self.enable_flexicache:
+            self.needs_rerank.clear()
+            self.is_first_decode.clear()
+
         for i, req_id in enumerate(self.input_batch.req_ids):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_scheduled_tokens[i] = num_tokens
             max_num_scheduled_tokens = max(max_num_scheduled_tokens,
                                            num_tokens)
+            seq_len = self.input_batch.num_computed_tokens_cpu[i] + num_tokens
+            self.seq_lens_np[i] = seq_len
+            if self.enable_flexicache:
+                num_decode_step = seq_len - self.input_batch.num_prompt_tokens[i]
+                self.input_batch.num_decode_step_np[i] = num_decode_step
+                if num_decode_step > 1 and (num_decode_step % self.rank_frequency == 0
+                                            or req_id in self.resumed_from_preemption):
+                    self.needs_rerank.append(i)
+                if num_decode_step == 1:
+                    self.input_batch.last_ranked_num_blks_np[i] = math.ceil(seq_len / self.block_size)
+                    self.is_first_decode.append(i)
+
+        if self.enable_flexicache:
+            needs_rerank_gpu    = torch.tensor(self.needs_rerank, device=self.device, dtype=torch.int64)
+            is_first_decode_gpu = torch.tensor(self.is_first_decode, device=self.device, dtype=torch.int64)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -527,30 +735,74 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                            out=self.input_ids_cpu[:total_num_scheduled_tokens])
 
         # Calculate the slot mapping.
-        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        # -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
-        # where K is the max_num_blocks_per_req and the block size is 2.
-        # NOTE(woosuk): We can't simply use `token_indices // block_size` here
-        # because M (max_model_len) is not necessarily divisible by block_size.
-        block_table_indices = (req_indices * self.max_num_blocks_per_req +
-                               positions_np // self.block_size)
-        # NOTE(woosuk): We use torch.index_select instead of np.take here
-        # because torch.index_select is much faster than np.take for large
-        # tensors.
-        block_table_cpu = self.input_batch.block_table.get_cpu_tensor()
-        block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
-        block_offsets = positions_np % self.block_size
-        np.add(block_numbers * self.block_size,
-               block_offsets,
-               out=self.slot_mapping_np[:total_num_scheduled_tokens])
+        if self.enable_flexicache:
+            num_scheduled_tokens_t = torch.from_numpy(num_scheduled_tokens).to(
+                device=self.device, dtype=torch.int32, non_blocking=True
+            )
+            self.positions[:total_num_scheduled_tokens].copy_(
+                self.positions_cpu[:total_num_scheduled_tokens], non_blocking=True
+            )
+
+            pos_gpu         = self.positions[:total_num_scheduled_tokens]
+            logical_idx_gpu = self.logical_indices[:total_num_scheduled_tokens]
+            offs_gpu        = self.offsets[:total_num_scheduled_tokens]
+
+            req_indices_gpu = torch.repeat_interleave(
+                torch.arange(self.input_batch.num_reqs, device=self.device, dtype=torch.int32),
+                num_scheduled_tokens_t
+            )                                                   # int32 [T]
+
+            torch.div(pos_gpu, self.block_size, rounding_mode="floor", out=logical_idx_gpu)
+            torch.remainder(pos_gpu, self.block_size, out=offs_gpu)
+
+            bt = self.input_batch.block_table.get_device_tensor()    # [R, L, H, Lb], int32
+            out = self.slot_mapping_gpu                              # [L, T_max, H], int64
+
+            if total_num_scheduled_tokens <= self.max_num_reqs: # All decode
+                phys = bt[req_indices_gpu.long(), :, :, logical_idx_gpu.long()]
+                slots = (phys.to(torch.int64) * self.block_size
+                        + offs_gpu.view(-1, 1, 1).to(torch.int64)).permute(1, 0, 2)
+                out[:, :total_num_scheduled_tokens, :].copy_(slots, non_blocking=True)
+            else:
+                BLOCK_T = 256
+                grid = (self.num_attn_layers,
+                        self.num_kv_heads,
+                        (total_num_scheduled_tokens + BLOCK_T - 1) // BLOCK_T)
+                
+                stride_bt_bs, stride_bt_ly, stride_bt_kh, stride_bt_bl = bt.stride()
+                stride_out_ly, stride_out_tok, stride_out_kh           = out.stride()
+
+                slot_map_kernel[grid](
+                    bt, out,
+                    req_indices_gpu, logical_idx_gpu, offs_gpu,
+                    stride_bt_bs, stride_bt_ly, stride_bt_kh, stride_bt_bl,
+                    stride_out_ly, stride_out_tok, stride_out_kh,
+                    BLOCK_T=BLOCK_T,
+                    NUM_TOKENS=total_num_scheduled_tokens,
+                    BLOCK_SIZE=self.block_size,
+                    num_warps=4, num_stages=1,
+                )
+        else:
+            # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+            # -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
+            # where K is the max_logical_blks_per_req and the block size is 2.
+            # NOTE(woosuk): We can't simply use `token_indices // block_size` here
+            # because M (max_model_len) is not necessarily divisible by block_size.
+            block_table_indices = (req_indices * self.max_logical_blks_per_req +
+                                    positions_np // self.block_size)
+            # NOTE(woosuk): We use torch.index_select instead of np.take here
+            # because torch.index_select is much faster than np.take for large
+            # tensors.
+            block_table_cpu = self.input_batch.block_table.get_cpu_tensor()
+            block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
+            block_offsets = positions_np % self.block_size
+            np.add(block_numbers * self.block_size,
+                    block_offsets,
+                    out=self.slot_mapping_np[:total_num_scheduled_tokens])
 
         # Prepare the attention metadata.
         self.query_start_loc_np[0] = 0
         self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
-
-        self.seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] +
-            num_scheduled_tokens)
 
         # Copy the tensors to the GPU.
         self.input_ids[:total_num_scheduled_tokens].copy_(
@@ -562,9 +814,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 non_blocking=True)
         else:
             # Common case (1D positions)
-            self.positions[:total_num_scheduled_tokens].copy_(
-                self.positions_cpu[:total_num_scheduled_tokens],
-                non_blocking=True)
+            if not self.enable_flexicache:
+                # We already copied positions to GPU above for flexicache.
+                self.positions[:total_num_scheduled_tokens].copy_(
+                    self.positions_cpu[:total_num_scheduled_tokens],
+                    non_blocking=True)
 
         # Prepare for cascade attention if enabled & beneficial.
         common_prefix_len = 0
@@ -574,12 +828,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.num_common_prefix_blocks,
             )
 
-        attn_metadata = self.attn_metadata_builder.build(
-            num_reqs=num_reqs,
-            num_actual_tokens=total_num_scheduled_tokens,
-            max_query_len=max_num_scheduled_tokens,
-            common_prefix_len=common_prefix_len,
-        )
+        if self.enable_flexicache:
+            from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadataBuilder
+            assert isinstance(self.attn_metadata_builder, FlashAttentionMetadataBuilder)
+
+            self.input_batch.num_decode_step_gpu.copy_(
+                self.input_batch.num_decode_step_cpu, non_blocking=True
+            )
+            self.input_batch.last_ranked_num_blks_gpu.copy_(
+                self.input_batch.last_ranked_num_blks_cpu, non_blocking=True
+            )
+
+            attn_metadata = self.attn_metadata_builder.build(
+                num_reqs=num_reqs,
+                num_actual_tokens=total_num_scheduled_tokens,
+                max_query_len=max_num_scheduled_tokens,
+                common_prefix_len=common_prefix_len,
+                enable_flexicache=True,
+                block_scores=self.input_batch.block_scores,
+                num_decode_step=self.input_batch.num_decode_step_gpu,
+                max_filtered_blocks=self.max_filtered_blocks,
+                rank_frequency=self.rank_frequency,
+                top_k_blocks=self.input_batch.top_k_blocks,
+                old_top_k_blocks=self.input_batch.old_top_k_blocks,
+                needs_rerank_gpu=needs_rerank_gpu,
+                is_first_decode_gpu=is_first_decode_gpu,
+                last_ranked_num_blks=self.input_batch.last_ranked_num_blks_gpu,
+            )
+        else:
+            attn_metadata = self.attn_metadata_builder.build(
+                num_reqs=num_reqs,
+                num_actual_tokens=total_num_scheduled_tokens,
+                max_query_len=max_num_scheduled_tokens,
+                common_prefix_len=common_prefix_len,
+            )
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
@@ -964,10 +1246,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
+        
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOuptut if there's no work to do.
-            return EMPTY_MODEL_RUNNER_OUTPUT
+            if self.enable_flexicache:
+                output = EMPTY_MODEL_RUNNER_OUTPUT
+                output.kv_reload_finished_reqs = self.poll_finished_kv_cache_reloads()
+                return output
+            else:
+                return EMPTY_MODEL_RUNNER_OUTPUT
 
         if self.is_multimodal_model:
             # Run the multimodal encoder if any.
@@ -1039,6 +1327,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
             )
+
         if not get_pp_group().is_last_rank:
             # For mid-pipeline stages, return the hidden states.
             return hidden_states
@@ -1124,7 +1413,89 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             spec_token_ids = self.generate_draft_token_ids(
                 valid_sampled_token_ids, sampling_metadata)
+            
+        if self.enable_flexicache:
+            blk = self.block_size
+            rank_f = self.rank_frequency
 
+            cnt_prefill = cnt_decode = cnt_d2h = cnt_first = cnt_rerank = 0
+
+            # single pass across requests in current batch order
+            for i, rid in enumerate(self.input_batch.req_ids):
+                prev   = int(self.requests[rid].num_computed_tokens)
+                sched  = int(scheduler_output.num_scheduled_tokens[rid])
+                prompt = int(self.input_batch.num_prompt_tokens[i])
+                new    = prev + sched
+
+                # prefill just finished (and at least one full page)
+                if (prev + sched == prompt) and prompt > 0 and (prompt // blk) > 0:
+                    self._idx_prefill[cnt_prefill] = i
+                    self._prompt_buf[cnt_prefill]  = prompt
+                    cnt_prefill += 1
+
+                # decode: a full page became complete now
+                if (sched == 1) and (new != prompt) and (new % blk == 0):
+                    self._idx_decode[cnt_decode] = i
+                    self._page_buf[cnt_decode]   = (new // blk) - 1
+                    cnt_decode += 1
+
+                self.input_batch.last_tx_blk_np[i]    = (prev // blk)
+                self.input_batch.total_full_blk_np[i] = (new  // blk)
+                # offload: full-page count increased
+                if self.input_batch.total_full_blk_np[i] > self.input_batch.last_tx_blk_np[i]:
+                    self._idx_d2h[cnt_d2h] = i
+                    cnt_d2h += 1
+
+                # first decode / rerank bookkeeping
+                dec_step = new - prompt
+                if dec_step == 1:
+                    self.input_batch.last_ranked_num_blks_np[i] = (new + blk - 1) // blk
+                    self._idx_first[cnt_first] = i
+                    cnt_first += 1
+                elif dec_step > 1 and (dec_step % rank_f == 0):
+                    self.input_batch.last_ranked_num_blks_np[i] = (new + blk - 1) // blk
+                    self._idx_rerank[cnt_rerank] = i
+                    cnt_rerank += 1
+
+            # launch kernels with precomputed selections
+            if cnt_prefill:
+                self.launch_store_minmax_key_for_prefill_selected(
+                    self._idx_prefill[:cnt_prefill], self._prompt_buf[:cnt_prefill]
+                )
+            if cnt_decode:
+                self.launch_store_minmax_key_for_decode_selected(
+                    self._idx_decode[:cnt_decode], self._page_buf[:cnt_decode]
+                )
+
+            prompt_offload_finished = set()
+            # so stop at the first offload that isn't done yet.
+            queue = self._prompt_offload_queue
+            while queue and queue[0][1].query():
+                rid, _ = queue.popleft()
+                prompt_offload_finished.add(rid)
+            if cnt_d2h:
+                self.offload_kv_cache_d2h_selected(self._idx_d2h[:cnt_d2h], cnt_prefill)
+
+            # scheduler payloads (first decode only)
+            topk_blocks_by_req      = {}
+            ranked_n_logical_by_req = {}
+            for j in self._idx_first[:cnt_first].tolist():
+                rid = self.input_batch.req_ids[j]
+                ranked_n_logical_by_req[rid] = int(self.input_batch.last_ranked_num_blks_np[j])
+                topk_blocks_by_req[rid] = torch.sort(
+                    self.input_batch.top_k_blocks[:, j, :, :], dim=-1
+                ).values.to(torch.int16).cpu().tolist()
+
+            # reload bookkeeping
+            self.needs_rerank    = self._idx_rerank[:cnt_rerank].tolist()
+            self.is_first_decode = self._idx_first [:cnt_first ].tolist()
+            kv_reload_finished = self.poll_finished_kv_cache_reloads()
+            kv_reload_started  = self.reload_kv_cache_h2d()
+        else:
+            topk_blocks_by_req, ranked_n_logical_by_req = {}, {}
+            kv_reload_started, kv_reload_finished = set(), set()
+            prompt_offload_finished = set()
+            
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -1132,6 +1503,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_token_ids=spec_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
+
+            topk_blocks_by_req      = topk_blocks_by_req,
+            ranked_n_logical_by_req = ranked_n_logical_by_req,
+            prompt_offload_finished = prompt_offload_finished,
+            kv_reload_started_reqs  = kv_reload_started,
+            kv_reload_finished_reqs = kv_reload_finished,
         )
 
     def generate_draft_token_ids(
@@ -1546,39 +1923,163 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "Hybrid models with more than one KV cache type are not "
                 "supported yet.")
 
-        kv_caches: dict[str, torch.Tensor] = {}
+        kv_caches: dict[str, torch.Tensor]     = {}
+        cpu_kv_caches: dict[str, torch.Tensor] = {}
 
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
-            kv_cache_spec = kv_cache_group.kv_cache_spec
-            for layer_name in kv_cache_group.layer_names:
-                tensor_config = kv_cache_config.tensors[layer_name]
-                assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
-                num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
-                # `num_blocks` is the number of blocks the model runner can use.
-                # `kv_cache_config.num_blocks` is the number of blocks that
-                # KVCacheManager may allocate.
-                # Since different GPUs may have different number of layers and
-                # different memory capacities, `num_blocks` can be different on
-                # different GPUs, and `kv_cache_config.num_blocks` is set to
-                # the min of all `num_blocks`. Verify it here.
-                assert num_blocks >= kv_cache_config.num_blocks
-                if isinstance(kv_cache_spec, FullAttentionSpec):
-                    kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-                        num_blocks, kv_cache_spec.block_size,
-                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
-                    dtype = kv_cache_spec.dtype
-                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
-                                                        dtype=dtype,
-                                                        device=self.device)
+        if self.enable_flexicache:
+            assert len(kv_cache_config.kv_cache_groups) == 1
+            kv_group      = kv_cache_config.kv_cache_groups[0]
+            kv_cache_spec = kv_group.kv_cache_spec
+
+            # TODO: (TAKBIR) It is a hacky solution to use FullAttentionSpec Ideally, should
+            # define a new FlexiCacheAttentionSpec. Will work on refactoring this later
+            assert isinstance(kv_cache_spec, FullAttentionSpec)
+            
+            layer_names    = kv_group.layer_names
+            kv_tensors     = kv_cache_config.tensors
+            cpu_kv_tensors = kv_cache_config.cpu_tensors
+            minmax_tensors = kv_cache_config.minmax_tensors
+            dtype          = kv_cache_spec.dtype
+
+            # Derive per-layer block counts
+            gpu_layer_nblk_list: list[int] = []
+            cpu_layer_nblk_list: list[int] = []
+            mm_layer_nblk: int | None      = None
+            for layer_name in layer_names:
+                gpu_tensor_config = kv_tensors[layer_name]
+                cpu_tensor_config = cpu_kv_tensors[layer_name]
+                mm_tensor_config  = minmax_tensors[layer_name]
+
+                assert gpu_tensor_config.size % kv_cache_spec.page_size_bytes == 0
+                assert cpu_tensor_config.size % kv_cache_spec.page_size_bytes == 0
+                assert mm_tensor_config.size  % (FlexiCacheConfig.minmax_key_cache_block_size * 2 * kv_cache_spec.head_size) == 0
+
+                gpu_nblk_L = gpu_tensor_config.size // kv_cache_spec.page_size_bytes
+                cpu_nblk_L = cpu_tensor_config.size // kv_cache_spec.page_size_bytes
+                mm_nblk_L  = mm_tensor_config.size  // kv_cache_spec.minmax_page_size_bytes
+
+                gpu_layer_nblk_list.append(int(gpu_nblk_L))
+                cpu_layer_nblk_list.append(int(cpu_nblk_L))
+
+                if mm_layer_nblk is None:
+                    mm_layer_nblk = int(mm_nblk_L)
                 else:
-                    # TODO: add new branches when introducing more types of
-                    # KV cache specs.
-                    raise ValueError("Unknown KV cache spec type.")
+                    assert mm_layer_nblk == int(mm_nblk_L), \
+                        f"All layers should have the same number of minmax blocks, got {mm_layer_nblk} and {int(mm_nblk_L)}"
+
+            assert len(gpu_layer_nblk_list) == len(cpu_layer_nblk_list) == self.num_attn_layers
+
+            # Allocate KV cache pools
+            gpu_layer_nblk      = np.asarray(gpu_layer_nblk_list, dtype=np.int64)           # [L]
+            gpu_layer_first_blk = np.concatenate(([0], np.cumsum(gpu_layer_nblk)[:-1]))     # [L]
+            gpu_total_blocks    = int(gpu_layer_nblk.sum())
+
+            if FlexiCacheConfig.num_unstable_heads > 0:
+                assert gpu_total_blocks == kv_cache_config.num_blocks, \
+                    f'Expected total {kv_cache_config.num_blocks} GPU blocks, got {gpu_total_blocks}'
+            else:
+                expected_total = (kv_cache_config.num_blocks) // self.num_attn_layers * self.num_attn_layers
+                assert gpu_total_blocks == expected_total, \
+                    f'Expected total {expected_total} GPU blocks, got {gpu_total_blocks}'
+
+            self.gpu_kv_cache_pool = torch.zeros(
+                (2, gpu_total_blocks, self.block_size, self.head_size),
+                dtype=dtype, device=self.device
+            )
+
+            cpu_layer_nblk      = np.asarray(cpu_layer_nblk_list, dtype=np.int64)        # [L]
+            cpu_layer_first_blk = np.concatenate(([0], np.cumsum(cpu_layer_nblk)[:-1]))  # [L]
+            cpu_total_blocks    = int(cpu_layer_nblk.sum())
+
+            if FlexiCacheConfig.num_unstable_heads > 0:
+                assert cpu_total_blocks == kv_cache_config.num_cpu_blocks, \
+                    f'Expected total {kv_cache_config.num_cpu_blocks} CPU blocks, got {cpu_total_blocks}'
+            else:
+                expected_total = (kv_cache_config.num_cpu_blocks) // self.num_attn_layers * self.num_attn_layers
+                assert cpu_total_blocks == expected_total, \
+                    f'Expected total {expected_total} CPU blocks, got {cpu_total_blocks}'
+
+            self.cpu_kv_cache_pool = torch.zeros(
+                (2, cpu_total_blocks, self.block_size, self.head_size),
+                dtype=dtype, device="cpu", pin_memory=True
+            )
+
+            assert mm_layer_nblk * self.num_attn_layers == kv_cache_config.num_minmax_blocks, \
+                f'Expected total {kv_cache_config.num_minmax_blocks} minmax blocks, got {mm_layer_nblk * self.num_attn_layers}'
+
+            self.minmax_key_cache = torch.zeros(
+                (self.num_attn_layers, mm_layer_nblk,
+                FlexiCacheConfig.minmax_key_cache_block_size, 2, kv_cache_spec.head_size),
+                dtype=dtype, device=self.device
+            )
+
+            # Derive per-layer views
+            for L, layer_name in enumerate(layer_names):
+                b_start_gpu = int(gpu_layer_first_blk[L])
+                b_end_gpu   = b_start_gpu + int(gpu_layer_nblk[L])
+                view_L_gpu  = self.gpu_kv_cache_pool[:, b_start_gpu:b_end_gpu, :, :]
+                kv_caches[layer_name] = view_L_gpu
+
+                b_start_cpu = int(cpu_layer_first_blk[L])
+                b_end_cpu   = b_start_cpu + int(cpu_layer_nblk[L])
+                view_L_cpu  = self.cpu_kv_cache_pool[:, b_start_cpu:b_end_cpu, :, :]
+                cpu_kv_caches[layer_name] = view_L_cpu
+
+            # Set required persistent metadata
+            self.gpu_layer_first_blk = torch.tensor(gpu_layer_first_blk, dtype=torch.int64, device=self.device)
+            self.gpu_layer_nblk      = torch.tensor(gpu_layer_nblk, dtype=torch.int32, device=self.device)
+
+            self.cpu_layer_first_blk = torch.tensor(cpu_layer_first_blk, dtype=torch.int64, device=self.device)
+            self.cpu_layer_nblk      = torch.tensor(cpu_layer_nblk, dtype=torch.int32, device=self.device)
+
+            self.layer_gpu_offsets = torch.cat([
+                self.gpu_layer_first_blk,
+                (self.gpu_layer_first_blk[-1] + self.gpu_layer_nblk[-1].to(torch.int64)).view(1)]
+            )
+            self.layer_cpu_offsets = torch.cat([
+                self.cpu_layer_first_blk,
+                (self.cpu_layer_first_blk[-1] + self.cpu_layer_nblk[-1].to(torch.int64)).view(1)]
+            )
+
+            # Register CPU KV cache pool with the KV-H2D transfer manager
+            self._kv_h2d_tx.register_cpu_kv_cache_pinned(self.cpu_kv_cache_pool)
+        else:
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                kv_cache_spec = kv_cache_group.kv_cache_spec
+                for layer_name in kv_cache_group.layer_names:
+                    tensor_config = kv_cache_config.tensors[layer_name]
+                    assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
+                    # `num_blocks` is the number of blocks the model runner can use.
+                    # `kv_cache_config.num_blocks` is the number of blocks that
+                    # KVCacheManager may allocate.
+                    # Since different GPUs may have different number of layers and
+                    # different memory capacities, `num_blocks` can be different on
+                    # different GPUs, and `kv_cache_config.num_blocks` is set to
+                    # the min of all `num_blocks`. Verify it here.
+                    assert num_blocks >= kv_cache_config.num_blocks
+                    if isinstance(kv_cache_spec, FullAttentionSpec):
+                        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                            num_blocks, kv_cache_spec.block_size,
+                            kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                        dtype = kv_cache_spec.dtype
+                        kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                                                            dtype=dtype,
+                                                            device=self.device)
+                    else:
+                        # TODO: add new branches when introducing more types of
+                        # KV cache specs.
+                        raise ValueError("Unknown KV cache spec type.")
+                    
+            cpu_kv_caches = None
 
         bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches)
+            self.kv_caches,
+            cpu_kv_caches,
+            self.cpu_kv_caches
+        )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -1606,7 +2107,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_kv_heads=attn_module.num_kv_heads,
                     head_size=attn_module.head_size,
                     dtype=self.kv_cache_dtype,
-                    use_mla=use_mla)
+                    use_mla=use_mla,
+                    enable_flexicache=self.enable_flexicache)
             elif attn_module.attn_type in (AttentionType.ENCODER,
                                            AttentionType.ENCODER_ONLY):
                 # encoder-only attention does not need KV cache.
@@ -1618,3 +2120,253 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     f"Unknown attention type: {attn_module.attn_type}")
 
         return kv_cache_spec
+    
+    def commit_block_table(self, num_reqs):
+        # GPU KV-CACHE BLOCK TABLE
+        bt_cpu = self.input_batch.block_table.get_cpu_tensor()
+        bt_gpu = self.input_batch.block_table.get_device_tensor()
+        dirty_gpu_kv = self.input_batch.block_table.build_dirty_ranges(num_reqs)
+
+        self._dirty_gpu_kv[:num_reqs].copy_(dirty_gpu_kv[:num_reqs], non_blocking=True)
+
+        self._bt_tx.block_table_h2d_dirty(
+            bt_cpu, bt_gpu, self._dirty_gpu_kv[:num_reqs],
+            self.max_num_reqs, self.num_attn_layers, self.num_kv_heads,
+            self.input_batch.block_table.max_logical_blks_per_req, num_reqs
+        )
+        
+        # GPU MIN-MAX KV CACHE BLOCK TABLE
+        mmb_cpu = self.input_batch.minmax_block_table.get_cpu_tensor()
+        mmb_gpu = self.input_batch.minmax_block_table.get_device_tensor()
+        dirty_gpu_mmb = self.input_batch.minmax_block_table.build_dirty_ranges(num_reqs)
+
+        self._dirty_gpu_mmb[:num_reqs].copy_(dirty_gpu_mmb[:num_reqs], non_blocking=True)
+
+        self._bt_tx.block_table_h2d_dirty(
+            mmb_cpu, mmb_gpu, self._dirty_gpu_mmb[:num_reqs],
+            self.max_num_reqs, self.num_attn_layers,self.num_kv_heads,
+            self.input_batch.minmax_block_table.max_logical_blks_per_req, num_reqs
+        )
+
+        # CPU KV CACHE BLOCK TABLE
+        cpu_kv_cpu = self.input_batch.cpu_block_table.get_cpu_tensor()
+        cpu_kv_gpu = self.input_batch.cpu_block_table.get_device_tensor()
+        dirty_cpu_kv = self.input_batch.cpu_block_table.build_dirty_ranges(num_reqs)
+
+        self._dirty_cpu_kv[:num_reqs].copy_(dirty_cpu_kv[:num_reqs], non_blocking=True)
+        self._bt_tx.block_table_h2d_dirty(
+            cpu_kv_cpu, cpu_kv_gpu, self._dirty_cpu_kv[:num_reqs],
+            self.max_num_reqs, self.num_attn_layers, self.num_kv_heads,
+            self.input_batch.cpu_block_table.max_logical_blks_per_req, num_reqs
+        )
+
+        self.input_batch.block_table.finalize_commit(num_reqs)
+        self.input_batch.minmax_block_table.finalize_commit(num_reqs)
+        self.input_batch.cpu_block_table.finalize_commit(num_reqs)
+
+    @torch.inference_mode()
+    def launch_store_minmax_key_for_prefill_selected(self, req_idx_np: np.ndarray, prompt_len_np: np.ndarray) -> None:
+        if req_idx_np.size == 0: return
+        max_full_pages = int((prompt_len_np.max() // self.block_size))
+        if max_full_pages == 0:  return
+
+        req_indices = torch.as_tensor(req_idx_np, dtype=torch.int32, device=self.device)
+        prompt_lens = torch.as_tensor(prompt_len_np, dtype=torch.int32, device=self.device)
+
+        cur_bt  = self.input_batch.block_table.get_device_tensor()[:, :self.input_batch.num_reqs]
+        cur_mmb = self.input_batch.minmax_block_table.get_device_tensor()[:, :self.input_batch.num_reqs]
+
+        x = 8
+        k_pool = self.gpu_kv_cache_pool[0].view(-1, self.head_size // x, self.block_size, x)
+
+        # strides
+        s_k_nb, s_k_hx, s_k_bs, s_k_x      = k_pool.stride()
+        s_bt_bs, s_bt_ly, s_bt_kh, s_bt_bl = cur_bt.stride()
+        s_mb_bs, s_mb_ly, s_mb_kh, s_mb_bl = cur_mmb.stride()
+        s_mk_l, s_mk_bl, s_mk_bs, s_mk_2, s_mk_hs = self.minmax_key_cache.stride()
+
+        grid = (req_indices.numel() * max_full_pages, self.num_attn_layers, self.num_kv_heads)
+        store_minmax_key_cache_for_prefill[grid](
+            k_pool, self.minmax_key_cache, cur_bt, cur_mmb, self.gpu_layer_first_blk,
+            s_k_nb, s_k_hx, s_k_bs, s_k_x,
+            s_bt_bs, s_bt_ly, s_bt_kh, s_bt_bl,
+            s_mb_bs, s_mb_ly, s_mb_kh, s_mb_bl,
+            s_mk_l, s_mk_bl, s_mk_bs, s_mk_2, s_mk_hs,
+            req_indices, prompt_lens, max_full_pages,
+            HEAD_SIZE=self.head_size, x=x, BLOCK_SIZE=self.block_size,
+            MINMAX_CACHE_BLOCK_SIZE=self.minmax_key_cache_block_size,
+            num_warps=4, num_stages=1,
+        )
+
+    @torch.inference_mode()
+    def launch_store_minmax_key_for_decode_selected(self, req_idx_np: np.ndarray, new_page_np: np.ndarray) -> None:
+        if req_idx_np.size == 0: return
+        req_indices  = torch.as_tensor(req_idx_np, dtype=torch.int32, device=self.device)
+        new_pages    = torch.as_tensor(new_page_np, dtype=torch.int32, device=self.device)
+
+        cur_bt  = self.input_batch.block_table.get_device_tensor()[:, :self.input_batch.num_reqs]
+        cur_mmb = self.input_batch.minmax_block_table.get_device_tensor()[:, :self.input_batch.num_reqs]
+
+        x = 8
+        k_pool = self.gpu_kv_cache_pool[0].view(-1, self.head_size // x, self.block_size, x)
+
+        s_k_nb, s_k_hx, s_k_bs, s_k_x      = k_pool.stride()
+        s_bt_bs, s_bt_ly, s_bt_kh, s_bt_bl = cur_bt.stride()
+        s_mb_bs, s_mb_ly, s_mb_kh, s_mb_bl = cur_mmb.stride()
+        s_mk_l, s_mk_bl, s_mk_bs, s_mk_2, s_mk_hs = self.minmax_key_cache.stride()
+
+        grid = (req_indices.numel(), self.num_attn_layers, self.num_kv_heads)
+        store_minmax_key_cache_for_decode[grid](
+            k_pool, self.minmax_key_cache, cur_bt, cur_mmb, self.gpu_layer_first_blk,
+            s_k_nb, s_k_hx, s_k_bs, s_k_x,
+            s_bt_bs, s_bt_ly, s_bt_kh, s_bt_bl,
+            s_mb_bs, s_mb_ly, s_mb_kh, s_mb_bl,
+            s_mk_l, s_mk_bl, s_mk_bs, s_mk_2, s_mk_hs,
+            req_indices, new_pages,
+            HEAD_SIZE=self.head_size, x=x, BLOCK_SIZE=self.block_size,
+            MINMAX_CACHE_BLOCK_SIZE=self.minmax_key_cache_block_size,
+            num_warps=4, num_stages=1,
+        )
+
+    @torch.inference_mode()
+    def offload_kv_cache_d2h_selected(self, req_idx_np: np.ndarray, cnt_prefill: int) -> None:
+        if req_idx_np.size == 0:
+            return
+        R = self.input_batch.num_reqs
+
+        # Keep these small control arrays fresh on device (non-blocking).
+        self.input_batch.last_tx_blk_gpu[:R].copy_(
+            self.input_batch.last_tx_blk_cpu[:R], non_blocking=True)
+        self.input_batch.total_full_blk_gpu[:R].copy_(
+            self.input_batch.total_full_blk_cpu[:R], non_blocking=True)
+
+        # Build (src,dst) mapping **on the main stream**, then launch the copy on the background stream.
+        src_bt = self.input_batch.block_table.get_device_tensor()[:R]         # [R, L, H, Lb]
+        dst_bt = self.input_batch.cpu_block_table.get_device_tensor()[:R]     # [R, L, H, Lb]
+        sel_req_ids = torch.as_tensor(req_idx_np, dtype=torch.int32, device=self.device)
+
+        # Precompute all pairs (global GPU block, global CPU block) to offload.
+        # This mirrors the H2D path (kv_cache_h2d_transfer) style.
+        src_pairs, dst_pairs, total_pairs = self._kv_d2h_tx.build_d2h_pairs(
+            src_bt,
+            dst_bt,
+            sel_req_ids,
+            self.input_batch.last_tx_blk_gpu[:R],
+            self.input_batch.total_full_blk_gpu[:R],
+            self.layer_gpu_offsets,   # GPU layer start offsets
+            self.layer_cpu_offsets    # CPU layer start offsets
+        )
+        if int(total_pairs) == 0 or src_pairs.numel() == 0:
+            return
+
+        # Hand off to the background stream with a small grid (doesn't starve the model).
+        assert self.main_stream == torch.cuda.current_stream(device=self.device)
+        start_event = torch.cuda.Event(blocking=False, enable_timing=False, interprocess=False)
+        start_event.record(self.main_stream)
+        self.background_stream.wait_event(start_event)
+
+        # Keep mapping tensors alive on the background stream.
+        src_pairs.record_stream(self.background_stream)
+        dst_pairs.record_stream(self.background_stream)
+
+        if cnt_prefill > 0:
+            finish_event = torch.cuda.Event(blocking=False, enable_timing=False, interprocess=False)
+
+        with torch.cuda.stream(self.background_stream):
+            CHUNK_PAIRS = 4096   # conservative chunking like H2D
+            GRID_BLOCKS = 8     # small grid to avoid stealing too many SMs
+            self._kv_d2h_tx.kv_cache_d2h_transfer(
+                self.gpu_kv_cache_pool,      # src: device pool
+                self.cpu_kv_cache_pool,      # dst: pinned host pool
+                src_pairs,                   # [N] int32 global GPU block ids
+                dst_pairs,                   # [N] int32 global CPU block ids
+                CHUNK_PAIRS,
+                GRID_BLOCKS
+            )
+            if cnt_prefill > 0:
+                finish_event.record()
+
+        if cnt_prefill > 0:
+            for i in range(cnt_prefill):
+                rid = self.input_batch.req_ids[self._idx_prefill[i]]
+                self._prompt_offload_queue.append((rid, finish_event))
+
+    def reload_kv_cache_h2d(self) -> set[str]:
+        kv_reload_started: set[str] = set()
+        if len(self.needs_rerank) == 0:
+            return kv_reload_started
+        
+        needs_rerank = []
+        for req_idx in self.needs_rerank:
+            if self.seq_lens_np[req_idx] > self.max_filtered_blocks * self.block_size:
+                needs_rerank.append(req_idx)
+
+        if len(needs_rerank) == 0:
+            return kv_reload_started
+
+        sel_idx = torch.tensor(needs_rerank, device='cuda', dtype=torch.int64)
+        # sel_idx = torch.tensor(self.needs_rerank, device='cuda', dtype=torch.int64)
+
+        R = self.input_batch.num_reqs
+        self.input_batch.total_full_blk_gpu[:R].copy_(self.input_batch.total_full_blk_cpu[:R], non_blocking=True)
+
+        evicted, incoming, counts, src, dst, total_pairs, g2g_src, g2g_dst, total_g2g = \
+            self._topk_swap_map.topk_swap_map_launcher_int64(
+                self.input_batch.old_top_k_blocks,
+                self.input_batch.top_k_blocks,
+                sel_idx,
+                self.input_batch.total_full_blk_gpu,
+                self.input_batch.block_table.get_device_tensor(),
+                self.input_batch.cpu_block_table.get_device_tensor(),
+                self.layer_cpu_offsets,
+                self.layer_gpu_offsets,
+                self.unstable_head_masks,
+                -1
+            )
+
+        assert self.main_stream == torch.cuda.current_stream(device=self.device)
+        start_event = torch.cuda.Event(blocking=False, enable_timing=False, interprocess=False)
+        start_event.record(self.main_stream)
+        self.background_stream.wait_event(start_event)
+
+        # Tie lifetime of src/dst to the background stream so their storage 
+        # isn't recycled early by the caching allocator.
+        src.record_stream(self.background_stream)
+        dst.record_stream(self.background_stream)
+        g2g_src.record_stream(self.background_stream)
+        g2g_dst.record_stream(self.background_stream)
+
+        finish_event = torch.cuda.Event(blocking=False, enable_timing=False, interprocess=False)
+
+        with torch.cuda.stream(self.background_stream):
+            CHUNK_PAIRS = 8192
+            GRID_BLOCKS = 32
+            self._kv_h2d_tx.kv_cache_h2d_transfer(
+                self.cpu_kv_cache_pool,
+                self.gpu_kv_cache_pool,
+                src,
+                dst,
+                chunk_pairs=CHUNK_PAIRS,
+                grid_blocks=GRID_BLOCKS,
+            )
+            if int(total_g2g) > 0:
+                # Indices are global GPU block indices along dim=1
+                self.gpu_kv_cache_pool[:, g2g_dst.long()] = \
+                    self.gpu_kv_cache_pool[:, g2g_src.long()]
+            finish_event.record()
+
+        for req_idx in needs_rerank:
+        # for req_idx in self.needs_rerank:
+            req_id = self.input_batch.req_ids[req_idx]
+            kv_reload_started.add(req_id)
+            self._kv_reload_queue.append((req_id, finish_event))
+
+        return kv_reload_started
+
+    def poll_finished_kv_cache_reloads(self) -> set[str]:
+        finished: set[str] = set()
+        queue = self._kv_reload_queue
+        while queue and queue[0][1].query():
+            rid, _ = queue.popleft()
+            finished.add(rid)
+        return finished

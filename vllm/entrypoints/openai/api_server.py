@@ -183,7 +183,7 @@ async def build_async_engine_client_from_engine_args(
     # V0 AsyncLLM.
     elif (MQLLMEngineClient.is_unsupported_config(vllm_config)
           or disable_frontend_multiprocessing):
-
+        assert not engine_args.enable_flexicache, "FlexiCache is Supported Only by V1 Engine"
         engine_client: Optional[EngineClient] = None
         try:
             engine_client = AsyncLLMEngine.from_vllm_config(
@@ -198,6 +198,7 @@ async def build_async_engine_client_from_engine_args(
 
     # V0MQLLMEngine.
     else:
+        assert not engine_args.enable_flexicache, "FlexiCache is Supported Only by V1 Engine"
         if "PROMETHEUS_MULTIPROC_DIR" not in os.environ:
             # Make TemporaryDirectory for prometheus multiprocessing
             # Note: global TemporaryDirectory will be automatically

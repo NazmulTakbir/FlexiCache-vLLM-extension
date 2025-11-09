@@ -26,15 +26,18 @@ class NewRequestData:
     mm_hashes: list[str]
     mm_positions: list[PlaceholderRange]
     sampling_params: SamplingParams
-    block_ids: list[int]
+    block_ids_by_layer: list[list[int]]
+    cpu_block_ids_by_layer: list[list[int]] | None
+    minmax_block_ids_by_layer: list[list[int]] | None
     num_computed_tokens: int
     lora_request: Optional[LoRARequest]
 
     @classmethod
     def from_request(
-        cls,
-        request: Request,
-        block_ids: list[int],
+        cls, request: Request,
+        block_ids_by_layer: list[list[int]],
+        minmax_block_ids_by_layer: list[list[int]] | None,
+        cpu_block_ids_by_layer: list[list[int]] | None
     ) -> NewRequestData:
         return cls(
             req_id=request.request_id,
@@ -44,9 +47,11 @@ class NewRequestData:
             mm_hashes=request.mm_hashes,
             mm_positions=request.mm_positions,
             sampling_params=request.sampling_params,
-            block_ids=block_ids,
+            block_ids_by_layer=block_ids_by_layer,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
+            minmax_block_ids_by_layer=minmax_block_ids_by_layer,
+            cpu_block_ids_by_layer=cpu_block_ids_by_layer,
         )
 
 
@@ -59,8 +64,10 @@ class CachedRequestData:
     # request's block IDs instead of appending to the existing block IDs.
     resumed_from_preemption: bool
     new_token_ids: list[int]
-    new_block_ids: list[int]
+    new_block_ids_by_layer: list[list[int]]
     num_computed_tokens: int
+    new_minmax_block_ids_by_layer: list[list[int]] | None
+    new_cpu_block_ids_by_layer: list[list[int]] | None
 
     @classmethod
     def from_request(
@@ -68,14 +75,18 @@ class CachedRequestData:
         request: Request,
         resumed_from_preemption: bool,
         new_token_ids: list[int],
-        new_block_ids: list[int],
+        new_block_ids_by_layer: list[list[int]],
+        new_minmax_block_ids_by_layer: list[list[int]] | None,
+        new_cpu_block_ids_by_layer: list[list[int]] | None
     ) -> CachedRequestData:
         return cls(
             req_id=request.request_id,
             resumed_from_preemption=resumed_from_preemption,
             new_token_ids=new_token_ids,
-            new_block_ids=new_block_ids,
+            new_block_ids_by_layer=new_block_ids_by_layer,
             num_computed_tokens=request.num_computed_tokens,
+            new_minmax_block_ids_by_layer=new_minmax_block_ids_by_layer,
+            new_cpu_block_ids_by_layer=new_cpu_block_ids_by_layer,
         )
 
 
@@ -122,3 +133,5 @@ class SchedulerOutput:
     structured_output_request_ids: dict[str, int]
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]
+    
+    preempted_req_ids: set[str]

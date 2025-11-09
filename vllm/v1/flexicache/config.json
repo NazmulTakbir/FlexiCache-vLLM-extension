@@ -1,0 +1,5 @@
+{
+    "avg_num_tokens_per_req": 20000,
+    "cpu_kv_cache_size": 180,
+    "minmax_key_cache_block_size": 128
+}

@@ -261,6 +261,57 @@ __global__ void reshape_and_cache_kernel(
   }
 }
 
+template <typename scalar_t, typename cache_t>
+__global__ void reshape_and_cache_flexicache_kernel(
+    const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
+    const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]
+    cache_t* __restrict__ key_cache,     // [num_blocks, head_size/x, block_size, x]
+    cache_t* __restrict__ value_cache,   // [num_blocks, head_size, block_size]
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens * num_heads]
+    const int key_stride, const int value_stride, const int num_heads,
+    const int head_size, const int block_size, const int x) {
+  // Each thread-block processes one token-head pair.
+  const int64_t token_head_idx = blockIdx.x;
+  const int64_t token_idx      = token_head_idx / num_heads;
+  const int64_t head_idx       = token_head_idx % num_heads;
+
+  const int64_t slot_idx = slot_mapping[token_head_idx];
+  if (slot_idx < 0) return; // padding
+
+  const int64_t block_idx    = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+
+  for (int head_offset = threadIdx.x; head_offset < head_size; head_offset += blockDim.x)
+  {
+      const int64_t src_key_idx =
+          token_idx * key_stride + head_idx * head_size + head_offset;
+      const int64_t src_val_idx =
+          token_idx * value_stride + head_idx * head_size + head_offset;
+
+      scalar_t tgt_key = key[src_key_idx];
+      scalar_t tgt_val = value[src_val_idx];
+      
+      // Key Cache Shape: [TOTAL_PHYSICAL_BLOCKS, HEAD_SIZE // x, BLOCK_SIZE, x]
+      const int x_idx = head_offset / x;
+      const int x_offset = head_offset % x;
+
+      const int64_t tgt_key_idx =
+          block_idx * (head_size / x) * block_size * x +
+          x_idx * block_size * x +
+          block_offset * x +
+          x_offset;
+
+      // Value Cache Shape: [TOTAL_PHYSICAL_BLOCKS, HEAD_SIZE, BLOCK_SIZE]
+      const int64_t tgt_value_idx =
+          block_idx * head_size * block_size +
+          head_offset * block_size +
+          block_offset;
+
+      key_cache[tgt_key_idx]   = tgt_key;
+      value_cache[tgt_value_idx] = tgt_val;
+  }
+}
+
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void reshape_and_cache_flash_kernel(
     const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
@@ -391,6 +442,46 @@ void reshape_and_cache(
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE)
+}
+
+#define CALL_RESHAPE_AND_CACHE_FLEXICACHE(KV_T, CACHE_T, ...)         \
+  vllm::reshape_and_cache_flexicache_kernel<KV_T, CACHE_T>            \
+      <<<grid, block, 0, stream>>>(                                   \
+          reinterpret_cast<KV_T*>(key.data_ptr()),                    \
+          reinterpret_cast<KV_T*>(value.data_ptr()),                  \
+          reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),           \
+          reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),         \
+          slot_mapping.data_ptr<int64_t>(), key_stride, value_stride, \
+          num_heads, head_size, block_size, x);
+
+void reshape_and_cache_flexicache(
+    torch::Tensor& key,    // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,  // [num_tokens, num_heads, head_size]
+    torch::Tensor&
+        key_cache,  // [num_blocks, head_size/x, block_size, x]
+    torch::Tensor&
+        value_cache,  // [num_blocks, head_size, block_size]
+    torch::Tensor& slot_mapping,  // [num_tokens * num_heads]
+    const std::string& kv_cache_dtype) {
+  int num_heads = key.size(1);
+  TORCH_CHECK(slot_mapping.size(0) % num_heads == 0,
+              "length(slot_mapping) must be a multiple of num_heads");
+  int num_tokens = slot_mapping.size(0) / num_heads; // real tokens, without padding due to Cuda Graphs
+  int head_size  = key.size(2);
+  int block_size = key_cache.size(2);
+  int x          = key_cache.size(3);
+
+  int key_stride = key.stride(0);
+  int value_stride = value.stride(0);
+
+  dim3 grid(slot_mapping.size(0));            // one block per (token, head)
+  dim3 block(std::min(head_size, 512));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  TORCH_CHECK(kv_cache_dtype == "auto", "FlexiCache only supports kv_cache_dtype=\"auto\"");
+
+  DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype, CALL_RESHAPE_AND_CACHE_FLEXICACHE)
 }
 
 // KV_T is the data type of key and value tensors.

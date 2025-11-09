@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """KV-Cache Utilities."""
 from collections import deque
+from itertools import islice
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Optional
@@ -11,6 +12,7 @@ from vllm.v1.kv_cache_interface import (KVCacheConfig, KVCacheGroupSpec,
                                         KVCacheSpec, KVCacheTensor)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
+from vllm.v1.flexicache.config import FlexiCacheConfig
 
 logger = init_logger(__name__)
 
@@ -92,7 +94,7 @@ class PrefixCachingMetrics:
         return self.aggregated_query_hit / self.aggregated_query_total
 
 
-@dataclass
+@dataclass(slots=True) 
 class KVCacheBlock:
     """KV-cache block metadata."""
     # Block ID, ranging from 0 to num_gpu_blocks - 1.
@@ -164,17 +166,24 @@ class FreeKVCacheBlockQueue:
         blocks: A list of KVCacheBlock objects.
     """
 
-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
-        self.num_free_blocks = len(blocks)
+    def __init__(self, blocks: list[KVCacheBlock], only_null_block: bool = False) -> None:
+        self.null_block = KVCacheBlock(block_id=-1)
 
-        # Initialize the doubly linked list of free blocks.
-        self.free_list_head: Optional[KVCacheBlock] = blocks[0]
-        self.free_list_tail: Optional[KVCacheBlock] = blocks[-1]
-        for i in range(self.num_free_blocks):
-            if i > 0:
-                blocks[i].prev_free_block = blocks[i - 1]
-            if i < self.num_free_blocks - 1:
-                blocks[i].next_free_block = blocks[i + 1]
+        if only_null_block:
+            # HACK. When a layer has no stable heads, it needs 0 blocks on CPU
+            # So, we create a dummy FreeKVCacheBlockQueue with infinite free blocks.
+            self.num_free_blocks = 1e10
+            self.free_list_head: Optional[KVCacheBlock] = self.null_block
+        else:
+            self.num_free_blocks = len(blocks)
+            # Initialize the doubly linked list of free blocks.
+            self.free_list_head: Optional[KVCacheBlock] = blocks[0]
+            self.free_list_tail: Optional[KVCacheBlock] = blocks[-1]
+            for i in range(self.num_free_blocks):
+                if i > 0:
+                    blocks[i].prev_free_block = blocks[i - 1]
+                if i < self.num_free_blocks - 1:
+                    blocks[i].next_free_block = blocks[i + 1]
 
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
@@ -246,7 +255,87 @@ class FreeKVCacheBlockQueue:
             curr_block = curr_block.next_free_block
         return ret
 
+    def pop_left_many(self, n: int) -> list[KVCacheBlock]:
+        if n <= 0:
+            return []
+        if n > self.num_free_blocks:
+            raise ValueError(f"Requested {n} blocks, only {self.num_free_blocks} free")
 
+        # Collect exactly n nodes in one pass, while advancing to new_head.
+        first = self.free_list_head
+        out: list[KVCacheBlock] = [None] * n  # preallocate
+        node = first
+        for i in range(n):
+            out[i] = node
+            node.ref_cnt = 1
+            node = node.next_free_block
+
+        new_head = node
+        if new_head is not None:
+            new_head.prev_free_block = None
+        else:
+            self.free_list_tail = None
+        self.free_list_head = new_head
+
+
+        self.num_free_blocks -= n
+        return out
+
+    def pop_left_many_with_null(self, n: int, num_kv_head: int, unstable_heads: set[int]) -> list[KVCacheBlock]:
+        if n <= 0:
+            return []
+
+        assert n % num_kv_head == 0
+        actually_needed = (n // num_kv_head) * (num_kv_head - len(unstable_heads))
+
+        if actually_needed > self.num_free_blocks:
+            raise ValueError(f"Requested {actually_needed} real blocks, only {self.num_free_blocks} free")
+
+        # Collect exactly n nodes in one pass, while advancing to new_head.
+        first = self.free_list_head
+        out: list[KVCacheBlock] = [None] * n  # preallocate
+        node = first
+        for i in range(n):
+            if i % num_kv_head in unstable_heads:
+                out[i] = self.null_block
+            else:
+                out[i] = node
+                node.ref_cnt = 1
+                node = node.next_free_block
+
+        new_head = node
+        if new_head is not None:
+            new_head.prev_free_block = None
+        else:
+            self.free_list_tail = None
+        self.free_list_head = new_head
+
+        self.num_free_blocks -= actually_needed
+        return out
+
+    def append_many(self, blocks: list[KVCacheBlock]) -> None:
+        """Append a list of blocks to the tail in one call."""
+        if not blocks:
+            return
+        for cur, nxt in zip(blocks, islice(blocks, 1, None)):
+            cur.ref_cnt = 0
+            cur.next_free_block = nxt
+            nxt.prev_free_block = cur
+        first = blocks[0]
+        last = blocks[-1]
+        last.ref_cnt = 0
+        first.prev_free_block = None
+        last.next_free_block = None
+
+        if self.free_list_tail is not None:
+            self.free_list_tail.next_free_block = first
+            first.prev_free_block = self.free_list_tail
+            self.free_list_tail = last
+        else:
+            self.free_list_head = first
+            self.free_list_tail = last
+        self.num_free_blocks += len(blocks)
+    
 def need_extra_keys(request: Request) -> bool:
     """Check whether the blocks allocated to this request need extra hash keys.
 
@@ -532,7 +621,7 @@ def is_kv_cache_type_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
 
 def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
                                       kv_cache_spec: dict[str, KVCacheSpec],
-                                      available_memory: int) -> KVCacheConfig:
+                                      available_memory: int, mem_portion_for_kv: float) -> KVCacheConfig:
     """
     Generates the KV cache configuration for a model with one type of KV cache.
     Divide the available memory equally among all layers.
@@ -545,50 +634,116 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     Returns:
         The generated KVCacheConfig
     """
-
     page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
     assert len(page_sizes) == 1
     page_size = page_sizes.pop()
 
-    num_blocks = int(available_memory // page_size // len(kv_cache_spec))
-    num_blocks = max(num_blocks, 0)
+    block_size = vllm_config.cache_config.block_size
 
-    if vllm_config.cache_config.num_gpu_blocks_override is not None:
-        num_gpu_blocks_override = \
-            vllm_config.cache_config.num_gpu_blocks_override
-        logger.info(
-            "Overriding num_gpu_blocks=%d with "
-            "num_gpu_blocks_override=%d", num_blocks, num_gpu_blocks_override)
-        num_blocks = num_gpu_blocks_override
+    if vllm_config.cache_config.enable_flexicache:
+        minmax_page_sizes = {layer.minmax_page_size_bytes for layer in kv_cache_spec.values()}
+        assert len(minmax_page_sizes) == 1
+        minmax_page_size = minmax_page_sizes.pop()
 
-    num_tokens = num_blocks * vllm_config.cache_config.block_size
-    num_tokens_str = f"{num_tokens:,}"
-    logger.info("GPU KV cache size: %s tokens", num_tokens_str)
-    max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
-    max_concurrency = num_tokens / vllm_config.model_config.max_model_len
-    logger.info("Maximum concurrency for %s tokens per request: %.2fx",
-                max_model_len_str, max_concurrency)
+        mem_for_gpu_kv_cache   = int(available_memory * mem_portion_for_kv)
+        mem_for_cpu_kv_cache   = FlexiCacheConfig.cpu_kv_cache_size
+        mem_for_minmax_k_cache = available_memory - mem_for_gpu_kv_cache
 
-    per_layer_size = page_size * num_blocks
-    # All layers have the same KV cache spec, so we create one kv cache group
-    # for all layers.
-    grouped_layer_names = [list(kv_cache_spec.keys())]
+        assert vllm_config.cache_config.num_gpu_blocks_override is None, \
+            "Not supported for FlexiCache (but should not be difficult to support if needed)."
+        
+        num_kv_heads = vllm_config.model_config.get_num_kv_heads(vllm_config.parallel_config)
+        num_layers   = len(kv_cache_spec)
 
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        tensors={
-            layer_name: KVCacheTensor(size=per_layer_size)
-            for layer_name in kv_cache_spec
-        },
-        kv_cache_groups=create_kv_cache_group_specs(kv_cache_spec,
-                                                    grouped_layer_names),
-    )
+        total_gpu_blocks = int(mem_for_gpu_kv_cache // page_size)
+        total_cpu_blocks = int(mem_for_cpu_kv_cache // page_size)
+        total_mm_blocks  = int((mem_for_minmax_k_cache // minmax_page_size) // num_layers * num_layers)
+
+        # This is approximate the total number of blocks is not evenly distributed to all layers and heads
+        # With smart allocation, the actual number of tokens should be much larger
+        approx_num_gpu_tokens = int(total_gpu_blocks * block_size / num_kv_heads) // num_layers
+        approx_num_cpu_tokens = int(total_cpu_blocks * block_size / num_kv_heads) // num_layers
+        approx_num_mm_tokens  = int(total_mm_blocks * FlexiCacheConfig.minmax_key_cache_block_size * block_size / num_kv_heads) // (num_layers)
+        logger.info("GPU KV cache size (lower bound): %s tokens approx", approx_num_gpu_tokens)
+        logger.info("CPU KV cache size (lower bound): %s tokens approx", approx_num_cpu_tokens)
+        logger.info("MinMax KV cache size: %s tokens approx", approx_num_mm_tokens)
+
+        gpu_blocks_per_layer, cpu_blocks_per_layer, mm_blocks_per_layer = \
+            FlexiCacheConfig.get_blocks_per_layer(total_gpu_blocks, total_cpu_blocks, total_mm_blocks)
+        
+        logger.info(f'GPU blocks per layer: {gpu_blocks_per_layer}')
+        logger.info(f'CPU blocks per layer: {cpu_blocks_per_layer}')
+        logger.info(f'MinMax blocks per layer: {mm_blocks_per_layer}')
+
+        gpu_tensors = {
+            lname: KVCacheTensor(size=page_size * gpu_blocks_per_layer[l_idx])
+            for l_idx, lname in enumerate(kv_cache_spec.keys())
+        }
+        cpu_tensors = {
+            lname: KVCacheTensor(size=page_size * cpu_blocks_per_layer[l_idx])
+            for l_idx, lname in enumerate(kv_cache_spec.keys())
+        }
+        mm_tensors = {
+            lname: KVCacheTensor(size=minmax_page_size * mm_blocks_per_layer[l_idx])
+            for l_idx, lname in enumerate(kv_cache_spec.keys())
+        }
+
+        # Layers might have different tensor sizes but still have the same KV cache spec,
+        # so we create one kv cache group for all layers.
+        grouped_layer_names = [list(kv_cache_spec.keys())]
+
+        kv_cache_config = KVCacheConfig(
+            num_blocks=total_gpu_blocks,
+            num_cpu_blocks=total_cpu_blocks,
+            num_minmax_blocks=total_mm_blocks,
+            tensors=gpu_tensors,
+            cpu_tensors=cpu_tensors,
+            minmax_tensors=mm_tensors,
+            kv_cache_groups=create_kv_cache_group_specs(kv_cache_spec,
+                                                        grouped_layer_names),
+        )
+    else:
+        num_blocks = int(available_memory // page_size // len(kv_cache_spec))
+        num_blocks = max(num_blocks, 0)
+
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
+            num_gpu_blocks_override = \
+                vllm_config.cache_config.num_gpu_blocks_override
+            logger.info(
+                "Overriding num_gpu_blocks=%d with "
+                "num_gpu_blocks_override=%d", num_blocks, num_gpu_blocks_override)
+            num_blocks = num_gpu_blocks_override
+
+        num_tokens = num_blocks * block_size
+        num_tokens_str = f"{num_tokens:,}"
+        logger.info("GPU KV cache size: %s tokens", num_tokens_str)
+        max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
+        max_concurrency = num_tokens / vllm_config.model_config.max_model_len
+        logger.info("Maximum concurrency for %s tokens per request: %.2fx",
+                    max_model_len_str, max_concurrency)
+
+        per_layer_size = page_size * num_blocks
+
+        # All layers have the same KV cache spec, so we create one kv cache group
+        # for all layers.
+        grouped_layer_names = [list(kv_cache_spec.keys())]
+
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            tensors={
+                layer_name: KVCacheTensor(size=per_layer_size)
+                for layer_name in kv_cache_spec
+            },
+            kv_cache_groups=create_kv_cache_group_specs(kv_cache_spec,
+                                                        grouped_layer_names),
+        )
+
     return kv_cache_config
 
 
 def get_kv_cache_config(vllm_config: VllmConfig,
                         kv_cache_spec: dict[str, KVCacheSpec],
-                        available_memory: int) -> KVCacheConfig:
+                        available_memory: int, mem_portion_for_kv: float) -> KVCacheConfig:
     """
     Generates the KV cache configuration for a model
     TODO: support hybrid models with more than one type of KV cache.
@@ -601,13 +756,13 @@ def get_kv_cache_config(vllm_config: VllmConfig,
     Returns:
         The generated KVCacheConfigs
     """
-    check_enough_kv_cache_memory(vllm_config, kv_cache_spec, available_memory)
+    check_enough_kv_cache_memory(vllm_config, kv_cache_spec, int(mem_portion_for_kv * available_memory))
     if is_kv_cache_type_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_config_uniform_type(vllm_config, kv_cache_spec,
-                                                 available_memory)
+                                                 available_memory, mem_portion_for_kv)
 
     raise NotImplementedError
 
@@ -642,7 +797,10 @@ def unify_kv_cache_configs(kv_cache_configs: list[KVCacheConfig]):
     # first `num_blocks` blocks of the tensor.
     min_num_blocks = min(kv_cache_config.num_blocks
                          for kv_cache_config in kv_cache_configs)
+    min_num_minmax_blocks = min(kv_cache_config.num_minmax_blocks
+                                for kv_cache_config in kv_cache_configs)
     for kv_cache_config in kv_cache_configs:
         kv_cache_config.num_blocks = min_num_blocks
+        kv_cache_config.num_minmax_blocks = min_num_minmax_blocks
 
     return kv_cache_configs

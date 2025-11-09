@@ -102,6 +102,37 @@ class AsyncLLM(EngineClient):
 
         self.output_handler: Optional[asyncio.Task] = None
 
+        if vllm_config.cache_config.enable_flexicache:
+            # Compatible with FlexiCache.
+            assert vllm_config.scheduler_config.chunked_prefill_enabled
+            # assert vllm_config.parallel_config.tensor_parallel_size == 2
+
+            # Incompatible with FlexiCache.
+            assert not vllm_config.cache_config.enable_prefix_caching
+            assert vllm_config.lora_config is None
+            assert not vllm_config.model_config.is_multimodal_model
+            assert vllm_config.parallel_config.pipeline_parallel_size == 1
+            assert vllm_config.parallel_config.distributed_executor_backend in ("mp", "uni")
+            # assert vllm_config.model_config.enforce_eager
+            assert vllm_config.model_config.disable_cascade_attn
+            assert vllm_config.quant_config is None
+            assert not vllm_config.cache_config.sliding_window
+            assert vllm_config.model_config.model in (
+                "meta-llama/Llama-3.1-8B-Instruct",
+                "mistralai/Mistral-Small-24B-Instruct-2501",
+                "Qwen/Qwen2.5-32B-Instruct",
+                "mistralai/Mistral-7B-Instruct-v0.2",
+                "mistralai/Mixtral-8x7B-Instruct-v0.1",
+                "lmsys/longchat-7b-v1.5-32k"
+            )
+            assert not vllm_config.model_config.uses_mrope
+            assert vllm_config.speculative_config is None
+            from vllm.platforms import current_platform
+            assert current_platform.is_cuda()
+            assert envs.VLLM_ATTENTION_BACKEND == "TRITON_ATTN_VLLM_V1"
+            assert envs.VLLM_USE_V1
+            
+            
     @classmethod
     def from_vllm_config(
         cls,
@@ -218,7 +249,8 @@ class AsyncLLM(EngineClient):
         await self.engine_core.add_request_async(request)
 
         if self.log_requests:
-            logger.info("Added request %s.", request.request_id)
+            pass
+            # logger.info("Added request %s.", request.request_id)
 
     # TODO: we should support multiple prompts in one call, as you
     # can do with LLM.generate. So that for multi-prompt completion

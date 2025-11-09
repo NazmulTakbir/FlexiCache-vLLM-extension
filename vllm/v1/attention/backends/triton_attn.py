@@ -9,6 +9,7 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
 from vllm.attention.ops.chunked_prefill_paged_decode import (
     chunked_prefill_paged_decode)
 from vllm.attention.ops.paged_attn import PagedAttention
+from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata, FlashAttentionMetadataBuilder)
@@ -55,7 +56,14 @@ class TritonAttentionBackend(AttentionBackend):
     def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
         return FlashAttentionMetadataBuilder
 
-
+    @staticmethod
+    def swap_blocks(
+        src_kv_cache: torch.Tensor,
+        dst_kv_cache: torch.Tensor,
+        src_to_dst: torch.Tensor,
+    ) -> None:
+        return swap_blocks(src_kv_cache, dst_kv_cache, src_to_dst)
+    
 class TritonAttentionImpl(AttentionImpl):
 
     def __init__(
@@ -110,6 +118,7 @@ class TritonAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
+        layer_number: int,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
@@ -142,18 +151,22 @@ class TritonAttentionImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache, self.num_kv_heads, self.head_size)
-
+            kv_cache, self.num_kv_heads, self.head_size, attn_metadata.enable_flexicache)
         # Reshape the input keys and values and store them in the cache.
+
+        slot_mapping = attn_metadata.slot_mapping[layer_number] \
+            if attn_metadata.enable_flexicache else attn_metadata.slot_mapping
+        
         PagedAttention.write_to_paged_cache(
             key,
             value,
             key_cache,
             value_cache,
-            attn_metadata.slot_mapping,
+            slot_mapping,
             self.kv_cache_dtype,
             layer._k_scale,
             layer._v_scale,
+            attn_metadata.enable_flexicache,
         )
 
         # Compute attention and update output up to `num_actual_tokens`.
@@ -168,11 +181,40 @@ class TritonAttentionImpl(AttentionImpl):
             block_table=attn_metadata.block_table,
             query_start_loc=attn_metadata.query_start_loc,
             seq_lens=attn_metadata.seq_lens,
+            max_seq_len=attn_metadata.max_seq_len,
             max_query_len=attn_metadata.max_query_len,
             k_scale=layer._k_scale,
             v_scale=layer._v_scale,
             alibi_slopes=self.alibi_slopes,
             sliding_window=self.sliding_window[0],
-            sm_scale=self.scale)
+            sm_scale=self.scale,
+            enable_flexicache=attn_metadata.enable_flexicache,
+            block_scores=attn_metadata.block_scores,
+            layer_number=layer_number,
+            num_decode_step=attn_metadata.num_decode_step,
+            rank_frequency=attn_metadata.rank_frequency,
+            max_filtered_blocks=attn_metadata.max_filtered_blocks,
+            minmax_block_table=attn_metadata.minmax_block_table,
+            minmax_key_cache=attn_metadata.minmax_key_cache,
+            top_k_blocks=attn_metadata.top_k_blocks,
+            old_top_k_blocks=attn_metadata.old_top_k_blocks,
+            needs_rerank_gpu=attn_metadata.needs_rerank_gpu,
+            any_needs_rerank=attn_metadata.any_needs_rerank,
+            last_ranked_num_blks=attn_metadata.last_ranked_num_blks,
+            is_first_decode_gpu=attn_metadata.is_first_decode_gpu,
+            any_first_decode=attn_metadata.any_first_decode,
+        )
 
         return output
+
+def swap_blocks(
+    src_kv_cache: torch.Tensor,
+    dst_kv_cache: torch.Tensor,
+    src_to_dst: torch.Tensor,
+) -> None:
+    src_key_cache = src_kv_cache[0]
+    dst_key_cache = dst_kv_cache[0]
+    ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst)
+    src_value_cache = src_kv_cache[1]
+    dst_value_cache = dst_kv_cache[1]
+    ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst)

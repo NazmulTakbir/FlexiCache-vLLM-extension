@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
 
 import torch
@@ -100,6 +100,13 @@ class ModelRunnerOutput:
     # [prompt_len]
     prompt_logprobs_dict: dict[str, Optional[LogprobsTensors]]
 
+    topk_blocks_by_req: Optional[dict[str, list[list[list[int]]]]] = None
+    ranked_n_logical_by_req: Optional[dict[str, int]] = None
+    prompt_offload_finished: set[str] = field(default_factory=set)
+
+    kv_reload_started_reqs: set[str]  = field(default_factory=set)
+    kv_reload_finished_reqs: set[str] = field(default_factory=set)
+
 
 EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(
     req_ids=[],
@@ -108,4 +115,6 @@ EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(
     spec_token_ids=None,
     logprobs=None,
     prompt_logprobs_dict={},
+    topk_blocks_by_req=None,
+    ranked_n_logical_by_req=None,
 )

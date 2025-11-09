@@ -17,7 +17,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
-
+from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
 
 class Attention(nn.Module):
     """Attention layer.
@@ -371,14 +371,16 @@ def unified_attention_with_output(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
-    self.impl.forward(self,
-                      query,
-                      key,
-                      value,
-                      kv_cache,
-                      attn_metadata,
-                      output=output)
-
+    
+    if isinstance(self.impl, TritonAttentionImpl):
+        self.impl.forward(
+            self, query, key, value,
+            kv_cache, attn_metadata, layer_number=int(layer_name.split(".")[2]),
+            output=output)
+    else:
+        self.impl.forward(
+            self, query, key, value,
+            kv_cache, attn_metadata, output=output)
 
 def unified_attention_with_output_fake(
     query: torch.Tensor,

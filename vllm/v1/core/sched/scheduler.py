@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
+import random
 
 import time
 from collections import deque
@@ -8,7 +9,7 @@ from collections.abc import Iterable
 from typing import Optional, Union
 
 from vllm.config import (CacheConfig, LoRAConfig, ModelConfig, SchedulerConfig,
-                         SpeculativeConfig)
+                         SpeculativeConfig, ParallelConfig)
 from vllm.logger import init_logger
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
@@ -38,6 +39,7 @@ class Scheduler(SchedulerInterface):
         speculative_config: Optional[SpeculativeConfig],
         log_stats: bool,
         structured_output_manager: StructuredOutputManager,
+        parallel_config: ParallelConfig,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -58,10 +60,16 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager = KVCacheManager(
             block_size=self.cache_config.block_size,
             num_gpu_blocks=num_gpu_blocks,
+            num_cpu_blocks=cache_config.num_cpu_blocks,
             max_model_len=self.max_model_len,
+            num_kv_heads=model_config.get_num_kv_heads(parallel_config),
             sliding_window=self.cache_config.sliding_window,
             enable_caching=self.cache_config.enable_prefix_caching,
-            log_stats=self.log_stats)
+            log_stats=self.log_stats,
+            enable_flexicache=self.cache_config.enable_flexicache,
+            num_minmax_blocks=self.cache_config.num_minmax_blocks,
+            num_attn_layers=model_config.get_num_layers(parallel_config),
+        )
         self.block_size = self.cache_config.block_size
 
         # req_id -> Request
@@ -104,6 +112,15 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager = EncoderCacheManager(
             cache_size=encoder_cache_size)
 
+        self.enable_flexicache = self.cache_config.enable_flexicache
+        if self.enable_flexicache:
+            # Requests currently undergoing a worker-managed KV transfer.
+            # While a req_id is in this set, we won't schedule decode tokens for it.
+            self.kv_reload_inflight: set[str] = set()
+            # Requests that have finished/aborted while a transfer was in-flight.
+            # We defer freeing their KV blocks until the worker signals transfer-done.
+            self.deferred_finish_for_reload: set[str] = set()
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -129,7 +146,9 @@ class Scheduler(SchedulerInterface):
         # uses structured decoding.
         structured_output_request_ids: dict[str, int] = {}
 
-        req_to_new_block_ids: dict[str, list[int]] = {}
+        req_to_new_block_ids_by_layer: dict[str, list[list[int]]] = {}
+        req_to_new_minmax_ids_by_layer: dict[str, list[list[int]]] = {}
+        req_to_new_cpu_block_ids_by_layer: dict[str, list[list[int]]] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
@@ -149,6 +168,11 @@ class Scheduler(SchedulerInterface):
                 # This request has already been scheduled.
                 req_index += 1
                 continue
+
+            if self.enable_flexicache:
+                if request.request_id in self.kv_reload_inflight:
+                    req_index += 1
+                    continue
 
             num_new_tokens = (request.num_tokens_with_spec -
                               request.num_computed_tokens)
@@ -171,7 +195,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             while True:
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                new_blocks, new_minmax_blocks, new_cpu_blocks = self.kv_cache_manager.allocate_slots(
                     request, num_new_tokens)
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -207,8 +231,14 @@ class Scheduler(SchedulerInterface):
                 # Therefore, we might introduce some additional
                 # cycle to fill in the bitmask, which could be a big no-op.
                 structured_output_request_ids[request.request_id] = req_index
-            req_to_new_block_ids[request.request_id] = [
-                b.block_id for b in new_blocks
+            req_to_new_block_ids_by_layer[request.request_id] = [
+                [b.block_id for b in blks_L] for blks_L in new_blocks
+            ]
+            req_to_new_minmax_ids_by_layer[request.request_id] = [
+                [b.block_id for b in mm_L] for mm_L in new_minmax_blocks
+            ]
+            req_to_new_cpu_block_ids_by_layer[request.request_id] = [
+                [b.block_id for b in cpu_L] for cpu_L in new_cpu_blocks
             ]
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
@@ -250,6 +280,8 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    # if self.enable_flexicache:
+                    #     assert False, "DEBUG: Should I increase max_num_running_reqs?"
                     break
 
                 request = self.waiting[0]
@@ -311,7 +343,7 @@ class Scheduler(SchedulerInterface):
                     # The request cannot be scheduled.
                     break
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                new_blocks, new_minmax_blocks, new_cpu_blocks = self.kv_cache_manager.allocate_slots(
                     request, num_new_tokens, computed_blocks)
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -337,9 +369,22 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     requested_loras.add(request.lora_request.lora_int_id)
-                req_to_new_block_ids[request.request_id] = [
-                    b.block_id for b in computed_blocks + new_blocks
-                ]
+                if self.enable_flexicache:
+                    req_to_new_block_ids_by_layer[request.request_id] = [
+                        [b.block_id for b in blks_L] for blks_L in new_blocks
+                    ]
+                    req_to_new_minmax_ids_by_layer[request.request_id] = [
+                        [b.block_id for b in mm_L] for mm_L in new_minmax_blocks
+                    ]
+                    req_to_new_cpu_block_ids_by_layer[request.request_id] = [
+                        [b.block_id for b in cpu_L] for cpu_L in new_cpu_blocks
+                    ]
+                else:
+                    req_to_new_block_ids_by_layer[request.request_id] = [[
+                        b.block_id for b in computed_blocks + new_blocks[0]
+                    ]]
+                    req_to_new_minmax_ids_by_layer[request.request_id] = [[]]
+                    req_to_new_cpu_block_ids_by_layer[request.request_id] = [[]]
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -372,7 +417,7 @@ class Scheduler(SchedulerInterface):
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = 0
-        if self.running:
+        if self.running and not self.enable_flexicache:
             any_request = self.running[0]
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
@@ -386,7 +431,9 @@ class Scheduler(SchedulerInterface):
         # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(req,
-                                        req_to_new_block_ids[req.request_id])
+                                        req_to_new_block_ids_by_layer[req.request_id],
+                                        req_to_new_minmax_ids_by_layer[req.request_id],
+                                        req_to_new_cpu_block_ids_by_layer[req.request_id])
             for req in scheduled_new_reqs
         ]
         resumed_reqs_data = [
@@ -394,7 +441,9 @@ class Scheduler(SchedulerInterface):
                 req,
                 num_scheduled_tokens[req.request_id],
                 len(scheduled_spec_decode_tokens.get(req.request_id, ())),
-                req_to_new_block_ids[req.request_id],
+                req_to_new_block_ids_by_layer[req.request_id],
+                req_to_new_minmax_ids_by_layer[req.request_id],
+                req_to_new_cpu_block_ids_by_layer[req.request_id],
                 resumed_from_preemption=True,
             ) for req in scheduled_resumed_reqs
         ]
@@ -403,7 +452,9 @@ class Scheduler(SchedulerInterface):
                 req,
                 num_scheduled_tokens[req.request_id],
                 len(scheduled_spec_decode_tokens.get(req.request_id, ())),
-                req_to_new_block_ids[req.request_id],
+                req_to_new_block_ids_by_layer[req.request_id],
+                req_to_new_minmax_ids_by_layer[req.request_id],
+                req_to_new_cpu_block_ids_by_layer[req.request_id],
                 resumed_from_preemption=False,
             ) for req in scheduled_running_reqs
         ]
@@ -423,6 +474,7 @@ class Scheduler(SchedulerInterface):
             free_encoder_input_ids=self.encoder_cache_manager.get_freed_ids(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
+            preempted_req_ids=set(req.request_id for req in preempted_reqs),
         )
 
         self.finished_req_ids = set()
@@ -433,7 +485,9 @@ class Scheduler(SchedulerInterface):
         request: Request,
         num_scheduled_tokens: int,
         num_scheduled_spec_tokens: int,
-        new_block_ids: list[int],
+        new_block_ids_by_layer: list[list[int]],
+        new_minmax_block_ids_by_layer: list[list[int]] | None,
+        new_cpu_block_ids_by_layer: list[list[int]] | None,
         resumed_from_preemption: bool,
     ) -> CachedRequestData:
         # OPTIMIZATION: Cache the CachedRequestData objects to avoid creating
@@ -446,13 +500,17 @@ class Scheduler(SchedulerInterface):
         if req_data is not None:
             req_data.resumed_from_preemption = resumed_from_preemption
             req_data.new_token_ids = new_token_ids
-            req_data.new_block_ids = new_block_ids
+            req_data.new_block_ids_by_layer = new_block_ids_by_layer
+            req_data.new_minmax_block_ids_by_layer = new_minmax_block_ids_by_layer
+            req_data.new_cpu_block_ids_by_layer = new_cpu_block_ids_by_layer
             req_data.num_computed_tokens = num_computed_tokens
         else:
             req_data = CachedRequestData.from_request(request,
                                                       resumed_from_preemption,
                                                       new_token_ids,
-                                                      new_block_ids)
+                                                      new_block_ids_by_layer,
+                                                      new_minmax_block_ids_by_layer,
+                                                      new_cpu_block_ids_by_layer,)
             self._cached_reqs_data[request.request_id] = req_data
         return req_data
 
@@ -540,6 +598,10 @@ class Scheduler(SchedulerInterface):
         new_running: list[Request] = []
         outputs: list[EngineCoreOutput] = []
 
+        if self.enable_flexicache:
+            for req_id in model_runner_output.kv_reload_started_reqs:
+                self.kv_reload_inflight.add(req_id)
+
         # NOTE(woosuk): As len(self.running) can be up to 1K or more, the below
         # loop can be a performance bottleneck. We should do our best to avoid
         # expensive operations inside the loop.
@@ -606,7 +668,12 @@ class Scheduler(SchedulerInterface):
                     # This must be called before we make the EngineCoreOutput.
                     stopped = check_stop(request, self.max_model_len)
                     if stopped:
-                        self._free_request(request)
+                        # Defer free if a KV transfer is in-flight to avoid
+                        # copy-overwrite corruption of reassigned blocks.
+                        if self.enable_flexicache and request.request_id in self.kv_reload_inflight:
+                            self.deferred_finish_for_reload.add(request.request_id)
+                        else:
+                            self._free_request(request)
                         break
 
                 # Extract sample logprobs if needed.
@@ -645,6 +712,27 @@ class Scheduler(SchedulerInterface):
             self.scheduled_req_ids.remove(request.request_id)
             if not stopped:
                 new_running.append(request)
+
+        if self.enable_flexicache:
+            if model_runner_output.topk_blocks_by_req:
+                for req_id, tk in model_runner_output.topk_blocks_by_req.items():
+                    n_full = model_runner_output.ranked_n_logical_by_req.get(req_id)
+                    self.kv_cache_manager.restrict_to_topk(req_id, tk, n_full)
+
+            to_free_req_id_seq_len = []
+            for req_id in model_runner_output.kv_reload_finished_reqs:
+                self.kv_reload_inflight.remove(req_id)
+                req = self.requests.get(req_id)
+                if req_id in self.deferred_finish_for_reload:
+                    self.deferred_finish_for_reload.remove(req_id)
+                    self._free_request(req)
+                else:
+                    to_free_req_id_seq_len.append((req_id, req.num_tokens))
+            
+            self.kv_cache_manager.free_pages_decode_phase(to_free_req_id_seq_len)
+
+            if model_runner_output.prompt_offload_finished:
+                self.kv_cache_manager.commit_pending_free(model_runner_output.prompt_offload_finished)
 
         self.running = new_running
         return EngineCoreOutputs(
@@ -686,7 +774,10 @@ class Scheduler(SchedulerInterface):
             else:
                 self.waiting.remove(request)
             request.status = finished_status
-            self._free_request(request)
+            if self.enable_flexicache and req_id in self.kv_reload_inflight:
+                self.deferred_finish_for_reload.add(req_id)
+            else:
+                self._free_request(request)
 
     def _free_request(self, request: Request) -> None:
         assert request.is_finished()
@@ -713,9 +804,17 @@ class Scheduler(SchedulerInterface):
     def make_stats(self) -> Optional[SchedulerStats]:
         if not self.log_stats:
             return None
+        gpu_cache_min_usage, gpu_cache_max_usage, gpu_min_id, gpu_max_id = \
+            self.kv_cache_manager.usage
+        cpu_cache_min_usage, cpu_cache_max_usage = self.kv_cache_manager.cpu_usage
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
-            gpu_cache_usage=self.kv_cache_manager.usage,
+            gpu_cache_min_usage=gpu_cache_min_usage,
+            gpu_cache_max_usage=gpu_cache_max_usage,
+            gpu_min_usage_layer_id=gpu_min_id,
+            gpu_max_usage_layer_id=gpu_max_id,
+            cpu_cache_min_usage=cpu_cache_min_usage,
+            cpu_cache_max_usage=cpu_cache_max_usage,
             prefix_cache_stats=self.kv_cache_manager.make_prefix_cache_stats(),
         )

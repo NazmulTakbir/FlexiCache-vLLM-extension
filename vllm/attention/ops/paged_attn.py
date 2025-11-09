@@ -52,15 +52,25 @@ class PagedAttention:
         kv_cache: torch.Tensor,
         num_kv_heads: int,
         head_size: int,
+        enable_flexicache: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = 16 // kv_cache.element_size()
-        num_blocks = kv_cache.shape[1]
+        if enable_flexicache:
+            x = 16 // kv_cache.element_size()
+            num_blocks = kv_cache.shape[1]
 
-        key_cache = kv_cache[0]
-        key_cache = key_cache.view(num_blocks, num_kv_heads, head_size // x,
-                                   -1, x)
-        value_cache = kv_cache[1]
-        value_cache = value_cache.view(num_blocks, num_kv_heads, head_size, -1)
+            key_cache = kv_cache[0]
+            key_cache = key_cache.view(num_blocks, head_size // x, -1, x)
+            value_cache = kv_cache[1]
+            value_cache = value_cache.view(num_blocks, head_size, -1)
+        else:
+            x = 16 // kv_cache.element_size()
+            num_blocks = kv_cache.shape[1]
+
+            key_cache = kv_cache[0]
+            key_cache = key_cache.view(num_blocks, num_kv_heads, head_size // x,
+                                    -1, x)
+            value_cache = kv_cache[1]
+            value_cache = value_cache.view(num_blocks, num_kv_heads, head_size, -1)
         return key_cache, value_cache
 
     @staticmethod
@@ -73,6 +83,7 @@ class PagedAttention:
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
+        enable_flexicache: bool = False,
     ) -> None:
         ops.reshape_and_cache(
             key,
@@ -83,6 +94,7 @@ class PagedAttention:
             kv_cache_dtype,
             k_scale,
             v_scale,
+            enable_flexicache=enable_flexicache,
         )
 
     @staticmethod

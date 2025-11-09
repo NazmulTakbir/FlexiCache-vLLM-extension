@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.distributed
 import torch.nn as nn
-
+import ctypes as C, torch
+from ctypes.util import find_library
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
@@ -87,6 +88,13 @@ class Worker(WorkerBase):
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up()
 
+    def get_stream_priorities(self):
+        cudart = C.CDLL(find_library("cudart") or "libcudart.so")
+        least = C.c_int(); great = C.c_int()
+        cudart.cudaDeviceGetStreamPriorityRange(C.byref(least), C.byref(great))
+
+        return (int(least.value), int(great.value))
+
     def init_device(self):
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
@@ -115,10 +123,16 @@ class Worker(WorkerBase):
                                             self.local_rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
+    
+        lo, hi = self.get_stream_priorities()
+        assert hi < lo, f'Expected low stream priority {lo} to be greater than high stream priority {hi}.'
+
+        self.main_stream = torch.cuda.Stream(device=self.device, priority=hi)
 
         # Construct the model runner
         self.model_runner: GPUModelRunner = GPUModelRunner(
-            self.vllm_config, self.device)
+            self.vllm_config, self.device, self.main_stream, hi, lo
+        )
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
@@ -239,8 +253,13 @@ class Worker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
-        output = self.model_runner.execute_model(scheduler_output)
-        return output if self.is_driver_worker else None
+        if self.vllm_config.cache_config.enable_flexicache:
+            with torch.cuda.stream(self.main_stream):
+                output = self.model_runner.execute_model(scheduler_output)
+                return output if self.is_driver_worker else None
+        else:
+            output = self.model_runner.execute_model(scheduler_output)
+            return output if self.is_driver_worker else None
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:

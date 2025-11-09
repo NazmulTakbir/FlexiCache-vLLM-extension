@@ -42,6 +42,8 @@ from vllm.transformers_utils.utils import is_s3
 from vllm.utils import (GiB_bytes, LayerBlockType, cuda_device_count_stateless,
                         get_cpu_memory, random_uuid, resolve_obj_by_qualname)
 
+from vllm.v1.flexicache.config import FlexiCacheConfig
+
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
 
@@ -823,7 +825,7 @@ class ModelConfig:
         if self.is_attention_free:
             return 0
 
-        if hasattr(self.hf_text_config, "head_dim"):
+        if hasattr(self.hf_text_config, "head_dim") and self.hf_text_config.head_dim is not None:
             return self.hf_text_config.head_dim
         # FIXME(woosuk): This may not be true for all models.
         return (self.hf_text_config.hidden_size //
@@ -1075,6 +1077,11 @@ class CacheConfig:
         gpu_memory_utilization: Fraction of GPU memory to use for the
             vLLM execution.
         swap_space: Size of the CPU swap space per GPU (in GiB).
+        enable_flexicache: Whether to use FlexiCache
+        num_unstable_heads: Number of unstable heads for FlexiCache.
+        rerank_frequency: Frequency of re-ranking for FlexiCache.
+        topK_budget: Top K budget for FlexiCache.
+        unstable_heads_profile_task: Task which was used to profile unstable heads for FlexiCache.
         cache_dtype: Data type for kv cache storage.
         is_attention_free: Whether the model is attention-free.
         num_gpu_blocks_override: Number of GPU blocks to use. This overrides the
@@ -1108,6 +1115,11 @@ class CacheConfig:
         block_size: int,
         gpu_memory_utilization: float,
         swap_space: float,
+        enable_flexicache: bool,
+        num_unstable_heads: int,
+        rerank_frequency: int,  
+        topK_budget: int,  
+        unstable_heads_profile_task: str,
         cache_dtype: str,
         is_attention_free: bool = False,
         num_gpu_blocks_override: Optional[int] = None,
@@ -1119,6 +1131,11 @@ class CacheConfig:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.swap_space_bytes = swap_space * GiB_bytes
+        self.enable_flexicache = enable_flexicache
+        self.num_unstable_heads = num_unstable_heads
+        self.rerank_frequency = rerank_frequency
+        self.topK_budget = topK_budget
+        self.unstable_heads_profile_task = unstable_heads_profile_task
         self.num_gpu_blocks_override = num_gpu_blocks_override
         self.cache_dtype = cache_dtype
         self.is_attention_free = is_attention_free
@@ -1132,6 +1149,7 @@ class CacheConfig:
 
         # Will be set after profiling.
         self.num_gpu_blocks: Optional[int] = None
+        self.num_minmax_blocks: Optional[int] = None
         self.num_cpu_blocks: Optional[int] = None
 
         # Set calculate_kv_scales to False if the value is unset.

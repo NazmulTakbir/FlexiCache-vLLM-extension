@@ -122,6 +122,11 @@ class EngineArgs:
     disable_cascade_attn: bool = False
     use_v2_block_manager: bool = True
     swap_space: float = 4  # GiB
+    enable_flexicache: Optional[bool] = False
+    num_unstable_heads: int = -1
+    rerank_frequency: int = -1
+    topK_budget: int = -1
+    unstable_heads_profile_task: str = None
     cpu_offload_gb: float = 0  # GiB
     gpu_memory_utilization: float = 0.90
     max_num_batched_tokens: Optional[int] = None
@@ -504,6 +509,30 @@ class EngineArgs:
                             type=float,
                             default=EngineArgs.swap_space,
                             help='CPU swap space size (GiB) per GPU.')
+        parser.add_argument('--enable-flexicache',
+            action='store_true',
+            default=EngineArgs.enable_flexicache,
+            help='Enable FlexiCache')
+        parser.add_argument(
+            '--num-unstable-heads',
+            type=int,
+            default=EngineArgs.num_unstable_heads,
+            help='Number of unstable heads for FlexiCache.')
+        parser.add_argument(
+            '--rerank-frequency',
+            type=int,
+            default=EngineArgs.rerank_frequency,
+            help='Frequency of re-ranking for FlexiCache.')
+        parser.add_argument(
+            '--topK-budget',
+            type=int,
+            default=EngineArgs.topK_budget,
+            help='Top K budget for FlexiCache.')
+        parser.add_argument(
+            '--unstable-heads-profile-task',
+            type=str,
+            default=EngineArgs.unstable_heads_profile_task,
+            help='Task which was used to profile unstable heads for FlexiCache.')
         parser.add_argument(
             '--cpu-offload-gb',
             type=float,
@@ -1324,6 +1353,11 @@ class EngineArgs:
             block_size=self.block_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             swap_space=self.swap_space,
+            enable_flexicache=self.enable_flexicache,
+            num_unstable_heads=self.num_unstable_heads,
+            unstable_heads_profile_task=self.unstable_heads_profile_task,
+            rerank_frequency=self.rerank_frequency,
+            topK_budget=self.topK_budget,
             cache_dtype=self.kv_cache_dtype,
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Datastructures defining an input batch
 
+import math
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, cast
 
@@ -15,6 +17,8 @@ from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import BlockTable
+from vllm.v1.flexicache.config import FlexiCacheConfig
+from vllm.v1.core.sched.output import SchedulerOutput
 
 _SAMPLING_EPS = 1e-5
 
@@ -33,7 +37,9 @@ class CachedRequestState:
     sampling_params: SamplingParams
     generator: Optional[torch.Generator]
 
-    block_ids: list[int]
+    block_ids_by_layer: list[list[int]]
+    minmax_block_ids_by_layer: list[list[int]] | None 
+    cpu_block_ids_by_layer: list[list[int]] | None
     num_computed_tokens: int
     output_token_ids: list[int]
 
@@ -53,17 +59,29 @@ class InputBatch:
         self,
         max_num_reqs: int,
         max_model_len: int,
-        max_num_blocks_per_req: int,
+        max_logical_blks_per_req: int,
         device: torch.device,
         pin_memory: bool,
         vocab_size: int,
+        enable_flexicache: bool,
+        num_kv_heads: int,
+        num_query_heads: int,
+        max_filtered_blocks: int,
+        num_attn_layers: int,
+        block_size: int,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
-        self.max_num_blocks_per_req = max_num_blocks_per_req
+        self.max_logical_blks_per_req = max_logical_blks_per_req
         self.device = device
         self.pin_memory = pin_memory
         self.vocab_size = vocab_size
+        self.enable_flexicache = enable_flexicache
+        self.num_kv_heads = num_kv_heads
+        self.num_query_heads = num_query_heads
+        self.max_filtered_blocks = max_filtered_blocks
+        self.num_attn_layers = num_attn_layers
+        self.block_size = block_size
 
         self._req_ids: list[Optional[str]] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -94,9 +112,13 @@ class InputBatch:
         # Block table.
         self.block_table = BlockTable(
             max_num_reqs=max_num_reqs,
-            max_num_blocks_per_req=max_num_blocks_per_req,
+            max_logical_blks_per_req=max_logical_blks_per_req,
             pin_memory=pin_memory,
             device=device,
+            enable_flexicache=enable_flexicache,
+            num_kv_heads=num_kv_heads,
+            num_layers=num_attn_layers,
+            name="KV-Block-Table"
         )
 
         # Sampling-related.
@@ -217,6 +239,72 @@ class InputBatch:
         # This is updated each time the batch constituents change.
         self.sampling_metadata = self._make_sampling_metadata()
 
+        if self.enable_flexicache:
+            self.minmax_block_table = BlockTable(
+                max_num_reqs=max_num_reqs,
+                max_logical_blks_per_req=\
+                    math.ceil(max_logical_blks_per_req / FlexiCacheConfig.minmax_key_cache_block_size),
+                pin_memory=pin_memory,
+                device=device,
+                enable_flexicache=enable_flexicache,
+                num_kv_heads=num_kv_heads,
+                num_layers=num_attn_layers,
+                name="MinMax KV Block Table"
+            )
+
+            self.block_scores = torch.zeros(
+                (self.num_attn_layers, self.max_num_reqs, self.num_kv_heads, self.max_logical_blks_per_req),
+                device=self.device,
+                dtype=torch.float32
+            )
+
+            self.num_decode_step_cpu = torch.zeros(
+                self.max_num_reqs, device="cpu", dtype=torch.int32
+            )
+            self.num_decode_step_np = self.num_decode_step_cpu.numpy()
+            self.num_decode_step_gpu = torch.zeros(
+                self.max_num_reqs, device=self.device, dtype=torch.int32
+            )
+            
+            self.last_ranked_num_blks_cpu = torch.zeros(
+                self.max_num_reqs, device="cpu", dtype=torch.int32
+            )
+            self.last_ranked_num_blks_np = self.last_ranked_num_blks_cpu.numpy()
+            self.last_ranked_num_blks_gpu = torch.zeros(
+                self.max_num_reqs, device=self.device, dtype=torch.int32
+            )
+
+            self.old_top_k_blocks = torch.zeros(
+                (self.num_attn_layers, self.max_num_reqs, self.num_kv_heads, self.max_filtered_blocks),
+                device=self.device,
+                dtype=torch.int64
+            )
+
+            self.top_k_blocks = torch.zeros(
+                (self.num_attn_layers, self.max_num_reqs, self.num_kv_heads, self.max_filtered_blocks),
+                device=self.device,
+                dtype=torch.int64
+            )
+
+            self.cpu_block_table = BlockTable(
+                max_num_reqs=max_num_reqs,
+                max_logical_blks_per_req=max_logical_blks_per_req,
+                pin_memory=pin_memory,
+                device=device,
+                enable_flexicache=enable_flexicache,
+                num_kv_heads=num_kv_heads,
+                num_layers=num_attn_layers,
+                name="CPU-KV Block Table"
+            )
+
+            self.last_tx_blk_cpu = torch.zeros(self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=True)
+            self.last_tx_blk_np  = self.last_tx_blk_cpu.numpy()
+            self.last_tx_blk_gpu = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
+
+            self.total_full_blk_cpu = torch.zeros(self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=True)
+            self.total_full_blk_np  = self.total_full_blk_cpu.numpy()
+            self.total_full_blk_gpu = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
@@ -227,6 +315,7 @@ class InputBatch:
         self,
         request: "CachedRequestState",
         req_index: Optional[int] = None,
+        is_paused_request: bool = False,
     ) -> None:
         if req_index is None:
             req_index = self.num_reqs
@@ -245,20 +334,33 @@ class InputBatch:
         # Copy the prompt token ids and output token ids.
         num_prompt_tokens = len(request.prompt_token_ids)
         self.num_prompt_tokens[req_index] = num_prompt_tokens
-        self.token_ids_cpu[
-            req_index, :num_prompt_tokens] = request.prompt_token_ids
         start_idx = num_prompt_tokens
         end_idx = start_idx + len(request.output_token_ids)
-        self.token_ids_cpu[req_index,
-                           start_idx:end_idx] = request.output_token_ids
         # Number of token ids in token_ids_cpu.
         # NOTE(woosuk): This may include spec decode tokens.
         self.num_tokens[req_index] = request.num_tokens
         # Number of tokens without spec decode tokens.
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
+        if self.enable_flexicache and is_paused_request:
+            # During decoding, when a paused request is resumed, we can efficiently
+            # copy the saved tokens in class PausedInputs. Here, we only need to copy
+            # the newly generated token.
+            self.token_ids_cpu[req_index, end_idx - 1] = request.output_token_ids[-1]
+        else:
+            self.token_ids_cpu[
+                req_index, :num_prompt_tokens] = request.prompt_token_ids
+            self.token_ids_cpu[req_index,
+                            start_idx:end_idx] = request.output_token_ids
+
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
-        self.block_table.add_row(request.block_ids, req_index)
+        if self.enable_flexicache:
+            if not is_paused_request:
+                self.block_table.add_row(request.block_ids_by_layer, req_index)
+                self.minmax_block_table.add_row(request.minmax_block_ids_by_layer, req_index)
+                self.cpu_block_table.add_row(request.cpu_block_ids_by_layer, req_index)
+        else:
+            self.block_table.add_row(request.block_ids_by_layer, req_index)
 
         sampling_params = request.sampling_params
         if sampling_params.sampling_type == SamplingType.GREEDY:
@@ -386,6 +488,7 @@ class InputBatch:
         return req_index
 
     def swap_states(self, i1: int, i2: int) -> None:
+        assert not self.enable_flexicache, "swap_states currently used by MLA, which is not supported with flexicache"
         old_id_i1 = self._req_ids[i1]
         old_id_i2 = self._req_ids[i2]
         self._req_ids[i1], self._req_ids[i2] =\
@@ -443,7 +546,7 @@ class InputBatch:
                     self.allowed_token_ids_mask_cpu_tensor[i1]
         self.block_table.swap_row(i1, i2)
 
-    def condense(self, empty_req_indices: list[int]) -> None:
+    def condense(self, empty_req_indices: list[int], scheduler_output: "SchedulerOutput") -> None:
         num_reqs = self.num_reqs
         if num_reqs == 0:
             # The batched states are empty.
@@ -465,6 +568,12 @@ class InputBatch:
                 break
 
             # Swap the states.
+            if self.enable_flexicache:
+                self.top_k_blocks[:, empty_index, :, :].copy_(
+                    self.top_k_blocks[:, last_req_index, :, :], non_blocking=True
+                )
+                self.last_ranked_num_blks_np[empty_index] = self.last_ranked_num_blks_np[last_req_index]
+
             req_id = self._req_ids[last_req_index]
             output_token_ids = self.req_output_token_ids[last_req_index]
             assert req_id is not None
@@ -475,8 +584,9 @@ class InputBatch:
             self.req_id_to_index[req_id] = empty_index
 
             num_tokens = self.num_tokens[last_req_index]
-            self.token_ids_cpu[empty_index, :num_tokens] = self.token_ids_cpu[
-                last_req_index, :num_tokens]
+            self.token_ids_cpu_tensor[empty_index, :num_tokens].copy_(
+                self.token_ids_cpu_tensor[last_req_index, :num_tokens]
+            )
             self.num_tokens[empty_index] = num_tokens
             self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[
                 last_req_index]
@@ -484,7 +594,19 @@ class InputBatch:
                 last_req_index]
             self.num_computed_tokens_cpu[
                 empty_index] = self.num_computed_tokens_cpu[last_req_index]
-            self.block_table.move_row(last_req_index, empty_index)
+            if self.enable_flexicache:
+                num_computed  = self.num_computed_tokens_cpu[empty_index]
+                num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+                num_prompt    = self.num_prompt_tokens[empty_index]
+                seq_len       = num_computed + num_scheduled
+
+                in_decode_phase    = seq_len > num_prompt
+
+                self.block_table.move_row(last_req_index, empty_index, in_decode_phase)
+                self.minmax_block_table.move_row(last_req_index, empty_index, in_decode_phase)
+                self.cpu_block_table.move_row(last_req_index, empty_index, in_decode_phase)
+            else:
+                self.block_table.move_row(last_req_index, empty_index)
             self.temperature_cpu[empty_index] = self.temperature_cpu[
                 last_req_index]
             self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
@@ -670,3 +792,177 @@ class InputBatch:
     @property
     def no_allowed_token_ids(self) -> bool:
         return len(self.has_allowed_token_ids) == 0
+
+class PausedInputs:
+
+    def __init__(
+        self,
+        max_paused_reqs: int,
+        device: torch.device,
+        enable_flexicache: bool,
+        num_kv_heads: int,
+        max_filtered_blocks: int,
+        num_attn_layers: int,
+        max_logical_blks_per_req: int,
+        max_model_len: int,
+        block_size: int,
+    ):
+        assert enable_flexicache
+
+        self.max_paused_reqs          = max_paused_reqs
+        self.num_kv_heads             = num_kv_heads
+        self.num_attn_layers          = num_attn_layers
+        self.max_filtered_blocks      = max_filtered_blocks
+        self.device                   = device
+        self.max_logical_blks_per_req = max_logical_blks_per_req
+        self.max_minmax_logical_blks  = math.ceil(max_logical_blks_per_req / FlexiCacheConfig.minmax_key_cache_block_size)
+        self.block_size               = block_size
+        self.max_model_len            = max_model_len
+        
+        self.top_k_blocks = torch.zeros(
+            (num_attn_layers, max_paused_reqs, num_kv_heads, max_filtered_blocks),
+            device=device,
+            dtype=torch.int64,
+        )
+
+        self.last_ranked_num_blks = torch.zeros(
+            max_paused_reqs, device="cpu", dtype=torch.int32
+        )
+
+        self.block_table = torch.zeros(
+            (max_paused_reqs, num_attn_layers, num_kv_heads, max_logical_blks_per_req),
+            device=device, dtype=torch.int32
+        )
+        self.bt_len = np.zeros(max_paused_reqs, dtype=np.int32)
+
+        self.mm_block_table = torch.zeros(
+            (max_paused_reqs, num_attn_layers, num_kv_heads, self.max_minmax_logical_blks),
+            device=device, dtype=torch.int32
+        )
+        self.mm_bt_len = np.zeros(max_paused_reqs, dtype=np.int32)
+
+        self.cpu_block_table = torch.zeros(
+            (max_paused_reqs, num_attn_layers, num_kv_heads, max_logical_blks_per_req),
+            device=device, dtype=torch.int32
+        )
+        self.cpu_bt_len = np.zeros(max_paused_reqs, dtype=np.int32)
+
+        self.req_to_slot: dict[str, int] = {}
+        self.free_slots: list[int]       = list(range(max_paused_reqs))
+
+        self.num_tokens = np.zeros(max_paused_reqs, dtype=np.int32)
+
+        self.token_ids_cpu_tensor = torch.zeros(
+            (max_paused_reqs, max_model_len),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
+        self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+
+    def save(self, req_id: str, input_batch: InputBatch) -> None:
+        assert req_id not in self.req_to_slot, "Request is already paused"
+        assert self.free_slots, "No free slots available to save paused request"
+
+        src_idx = input_batch.req_id_to_index[req_id]
+
+        slot = self.free_slots.pop()
+        self.req_to_slot[req_id] = slot
+
+        self.last_ranked_num_blks[slot] = input_batch.last_ranked_num_blks_np[src_idx]
+
+        self.top_k_blocks[:, slot, :, :].copy_(
+            input_batch.top_k_blocks[:, src_idx, :, :], non_blocking=True
+        )
+
+        bt_len = int(input_batch.block_table.num_logical_blocks_per_row[src_idx])
+        self.bt_len[slot] = bt_len
+        self.block_table[slot, :, :, :bt_len].copy_(
+            input_batch.block_table.get_device_tensor()[src_idx, :, :, :bt_len], non_blocking=True
+         )
+
+        mm_bt_len = int(input_batch.minmax_block_table.num_logical_blocks_per_row[src_idx])
+        self.mm_bt_len[slot] = mm_bt_len
+        self.mm_block_table[slot, :, :, :mm_bt_len].copy_(
+            input_batch.minmax_block_table.get_device_tensor()[src_idx, :, :, :mm_bt_len], non_blocking=True
+        )
+
+        cpu_bt_len = int(input_batch.cpu_block_table.num_logical_blocks_per_row[src_idx])
+        self.cpu_bt_len[slot] = cpu_bt_len
+        self.cpu_block_table[slot, :, :, :cpu_bt_len].copy_(
+            input_batch.cpu_block_table.get_device_tensor()[src_idx, :, :, :cpu_bt_len], non_blocking=True
+        )
+
+        num_tokens                            = input_batch.num_tokens[src_idx]
+        self.num_tokens[slot]                 = num_tokens
+        self.token_ids_cpu[slot, :num_tokens] = input_batch.token_ids_cpu[src_idx, :num_tokens]
+
+        assert bt_len == input_batch.block_table.committed_num_logical_blocks[src_idx] \
+            and mm_bt_len == input_batch.minmax_block_table.committed_num_logical_blocks[src_idx] \
+            and cpu_bt_len == input_batch.cpu_block_table.committed_num_logical_blocks[src_idx], \
+                "For an unscheduled request in decode phase, all blocks should be committed"
+
+    def _cur_logical(self, layered_blocks):
+        return len(layered_blocks[0]) // self.num_kv_heads
+
+    def restore(self, req_id: str, input_batch: InputBatch, req_state: "CachedRequestState") -> None:
+        slot = self.req_to_slot.pop(req_id, None)
+
+        assert slot is not None, "Request to restore not found in paused requests"
+        
+        dst_idx = input_batch.req_id_to_index[req_id]
+
+        input_batch.last_ranked_num_blks_np[dst_idx] = self.last_ranked_num_blks[slot]
+
+        input_batch.top_k_blocks[:, dst_idx, :, :].copy_(
+            self.top_k_blocks[:, slot, :, :], non_blocking=True
+        )
+
+        saved_bt_len = int(self.bt_len[slot])
+        input_batch.block_table.num_logical_blocks_per_row[dst_idx] = saved_bt_len
+        input_batch.block_table.committed_num_logical_blocks[dst_idx] = saved_bt_len
+        input_batch.block_table.get_device_tensor()[dst_idx, :, :, :saved_bt_len].copy_(
+            self.block_table[slot, :, :, :saved_bt_len], non_blocking=True
+        )
+
+        saved_mmb_len = int(self.mm_bt_len[slot])
+        input_batch.minmax_block_table.num_logical_blocks_per_row[dst_idx] = saved_mmb_len
+        input_batch.minmax_block_table.committed_num_logical_blocks[dst_idx] = saved_mmb_len
+        input_batch.minmax_block_table.get_device_tensor()[dst_idx, :, :, :saved_mmb_len].copy_(
+            self.mm_block_table[slot, :, :, :saved_mmb_len], non_blocking=True
+        )
+
+        saved_cpu_len = int(self.cpu_bt_len[slot])
+        input_batch.cpu_block_table.num_logical_blocks_per_row[dst_idx] = saved_cpu_len
+        input_batch.cpu_block_table.committed_num_logical_blocks[dst_idx] = saved_cpu_len
+        input_batch.cpu_block_table.get_device_tensor()[dst_idx, :, :, :saved_cpu_len].copy_(
+            self.cpu_block_table[slot, :, :, :saved_cpu_len], non_blocking=True
+        )
+
+        if self._cur_logical(req_state.block_ids_by_layer) > saved_bt_len:
+            start = saved_bt_len * self.num_kv_heads
+            delta = [layer_blocks[start:] for layer_blocks in req_state.block_ids_by_layer]
+            input_batch.block_table.append_row(delta, dst_idx)
+
+        if self._cur_logical(req_state.minmax_block_ids_by_layer) > saved_mmb_len:
+            start_mmb = saved_mmb_len * self.num_kv_heads
+            delta_mmb = [layer_blocks[start_mmb:] for layer_blocks in req_state.minmax_block_ids_by_layer]
+            input_batch.minmax_block_table.append_row(delta_mmb, dst_idx)
+
+        if self._cur_logical(req_state.cpu_block_ids_by_layer) > saved_cpu_len:
+            start_cpu = saved_cpu_len * self.num_kv_heads
+            delta_cpu = [layer_blocks[start_cpu:] for layer_blocks in req_state.cpu_block_ids_by_layer]
+            input_batch.cpu_block_table.append_row(delta_cpu, dst_idx)
+
+        num_saved_tokens = self.num_tokens[slot]
+        input_batch.token_ids_cpu[dst_idx, :num_saved_tokens] = self.token_ids_cpu[slot, :num_saved_tokens]
+
+        self.free_slots.append(slot)
+
+    def discard(self, req_id: str) -> None:
+        slot = self.req_to_slot.pop(req_id, None)
+        if slot is not None:
+            self.free_slots.append(slot)
+
+    def is_paused(self, req_id: str) -> bool:
+        return req_id in self.req_to_slot
