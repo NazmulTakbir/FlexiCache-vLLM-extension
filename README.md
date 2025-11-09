@@ -1,3 +1,33 @@
+# FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management
+**Extension of [vLLM](https://github.com/vllm-project/vllm)**  
+
+---
+
+**FlexiCache** is a hierarchical KV-cache management system built on top of **vLLM**, designed to reduce GPU memory usage and improve LLM inference efficiency by leveraging the **temporal stability of attention heads**.
+
+> **Key Idea:** Different attention heads exhibit varying temporal stability in their critical tokens.  
+> FlexiCache classifies heads into **stable** and **unstable** types.  
+> - *Unstable heads* keep full KV-cache pages on GPU.  
+> - *Stable heads* maintain only Top-K pages on GPU and offload others to host memory, with periodic re-ranking and reloading.
+
+**Performance Highlights**
+- ✅ Reduces GPU KV cache memory footprint by **up to 70%**
+- ⚡ Improves offline serving throughput by **1.38–1.55×**
+- 🕒 Lowers online token latency by **1.6–2.1×**
+- 🎯 Maintains accuracy in long-context, long-generation scenarios
+
+📘 **Detailed README to come — for now, please read our paper for full details:**  
+👉 [https://arxiv.org/abs/2511.00868](https://arxiv.org/abs/2511.00868)
+
+---
+
+> This repository is based on **vLLM** (Apache-2.0 License) and extends it to introduce **FlexiCache**.  
+> The original vLLM README follows below.
+
+---
+<h1 align="center">
+vLLM README (Original)
+</h1>
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/source/assets/logos/vllm-logo-text-dark.png">
