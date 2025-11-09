@@ -2,7 +2,7 @@
 # entrypoints test
 # librosa==0.10.2.post1 # required by audio tests in entrypoints/openai
 audioread==3.0.1
-cffi==1.17.1
+cffi==2.0.0
 decorator==5.2.1
 lazy-loader==0.4
 platformdirs==4.3.6
