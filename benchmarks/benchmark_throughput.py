@@ -8,12 +8,13 @@ import random
 import time
 import warnings
 from typing import Any, Optional, Union
+import numpy as np
 
 import torch
 import uvloop
 from benchmark_dataset import (BurstGPTDataset, HuggingFaceDataset,
                                RandomDataset, SampleRequest, ShareGPTDataset,
-                               SonnetDataset, VisionArenaDataset)
+                               SonnetDataset, VisionArenaDataset, LEvalDataset)
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from tqdm import tqdm
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
@@ -174,6 +175,14 @@ async def run_vllm_async(
                 ))
             lora_requests.append(request.lora_request)
 
+        warmup_gen = llm.generate(
+            prompts[0],
+            sampling_params[0],
+            lora_request=lora_requests[0],
+            request_id="warmup")
+        async for _ in warmup_gen:
+            pass
+
         generators = []
         start = time.perf_counter()
         for i, (prompt, sp,
@@ -301,9 +310,14 @@ def get_requests(args, tokenizer):
         "output_len": args.output_len,
     }
     if args.dataset_path is None or args.dataset_name == "random":
-        sample_kwargs["range_ratio"] = args.random_range_ratio
+        sample_kwargs["range_ratio_input"] = args.random_range_ratio_input
+        sample_kwargs["range_ratio_output"] = args.random_range_ratio_output
         sample_kwargs["prefix_len"] = args.prefix_len
         dataset_cls = RandomDataset
+    if args.dataset_name == "leval":
+        sample_kwargs["range_ratio_input"] = args.random_range_ratio_input
+        sample_kwargs["range_ratio_output"] = args.random_range_ratio_output
+        dataset_cls = LEvalDataset
     elif args.dataset_name == "sharegpt":
         dataset_cls = ShareGPTDataset
         if args.backend == "vllm-chat":
@@ -341,6 +355,7 @@ def main(args: argparse.Namespace):
         args.seed = 0
     print(args)
     random.seed(args.seed)
+    np.random.seed(args.seed)
     # Sample the requests.
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=args.trust_remote_code)
@@ -416,12 +431,13 @@ def main(args: argparse.Namespace):
             "elapsed_time": elapsed_time,
             "num_requests": len(requests),
             "total_num_tokens": total_num_tokens,
-            "requests_per_second": len(requests) / elapsed_time,
-            "tokens_per_second": total_num_tokens / elapsed_time,
+            "requests_per_second": round(len(requests) / elapsed_time, 2),
+            "tokens_per_second": round(total_num_tokens / elapsed_time, 2),
+            "output_tokens_per_second": round(total_output_tokens / elapsed_time, 2),
         }
         with open(args.output_json, "w") as f:
             json.dump(results, f, indent=4)
-        save_to_pytorch_benchmark_format(args, results)
+        # save_to_pytorch_benchmark_format(args, results)
 
 
 def validate_args(args):
@@ -467,9 +483,10 @@ def validate_args(args):
             "When --dataset-name is 'hf', backend must be 'vllm-chat'")
 
     # --random-range-ratio: only used when dataset_name is 'random'
-    if args.dataset_name != 'random' and args.random_range_ratio is not None:
-        warnings.warn("--random-range-ratio will be ignored since \
-                --dataset-name is not 'random'.",
+    if args.dataset_name != 'random' and args.dataset_name != 'leval' \
+        and (args.random_range_ratio_input is not None or args.random_range_ratio_output is not None):
+        warnings.warn("--random-range-ratio-(input/output) will be ignored since \
+                --dataset-name is not 'random' or 'leval.",
                       stacklevel=2)
 
     # --prefix-len: only used when dataset_name is 'random', 'sonnet', or not
@@ -515,7 +532,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset-name",
         type=str,
-        choices=["sharegpt", "random", "sonnet", "burstgpt", "hf"],
+        choices=["sharegpt", "random", "sonnet", "burstgpt", "hf", 'leval'],
         help="Name of the dataset to benchmark on.",
         default="sharegpt")
     parser.add_argument(
@@ -583,10 +600,17 @@ if __name__ == "__main__":
                         "This is for the RandomDataset and SonnetDataset")
     # random dataset
     parser.add_argument(
-        "--random-range-ratio",
+        "--random-range-ratio-input",
         type=float,
         default=None,
-        help="Range of sampled ratio of input/output length, "
+        help="Range of sampled ratio of input length, "
+        "used only for RandomDataSet.",
+    )
+    parser.add_argument(
+        "--random-range-ratio-output",
+        type=float,
+        default=None,
+        help="Range of sampled ratio of output length, "
         "used only for RandomDataSet.",
     )
 

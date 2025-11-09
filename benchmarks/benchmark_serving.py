@@ -54,7 +54,7 @@ except ImportError:
 
 from benchmark_dataset import (BurstGPTDataset, HuggingFaceDataset,
                                RandomDataset, SampleRequest, ShareGPTDataset,
-                               SonnetDataset, VisionArenaDataset)
+                               SonnetDataset, VisionArenaDataset, LEvalDataset)
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
@@ -142,7 +142,7 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-) -> tuple[BenchmarkMetrics, list[int]]:
+) -> tuple[BenchmarkMetrics, list[int], list[float]]:
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
@@ -239,7 +239,7 @@ def calculate_metrics(
                              for p in selected_percentiles],
     )
 
-    return metrics, actual_output_lens
+    return metrics, actual_output_lens, all_tpots
 
 
 async def benchmark(
@@ -390,7 +390,7 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    metrics, actual_output_lens = calculate_metrics(
+    metrics, actual_output_lens, tpot_samples = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -430,6 +430,7 @@ async def benchmark(
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
+        "tpots": tpot_samples,
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
@@ -623,7 +624,26 @@ def main(args: argparse.Namespace):
                 prefix_len=args.random_prefix_len,
                 input_len=args.random_input_len,
                 output_len=args.random_output_len,
-                range_ratio=args.random_range_ratio,
+                range_ratio_input=args.random_range_ratio_input,
+                range_ratio_output=args.random_range_ratio_output,
+            ),
+            "leval":
+            lambda: LEvalDataset(dataset_path=args.dataset_path).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                input_len=args.random_input_len,
+                output_len=args.random_output_len,
+                range_ratio_input=args.random_range_ratio_input,
+                range_ratio_output=args.random_range_ratio_output,
+            ),
+            "leval":
+            lambda: LEvalDataset(dataset_path=args.dataset_path).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                input_len=args.random_input_len,
+                output_len=args.random_output_len,
+                range_ratio_input=args.random_range_ratio_input,
+                range_ratio_output=args.random_range_ratio_output,
             )
         }
 
@@ -683,16 +703,7 @@ def main(args: argparse.Namespace):
                     raise ValueError(
                         "Invalid metadata format. Please use KEY=VALUE format."
                     )
-
-        if not args.save_detailed:
-            # Remove fields with too many data points
-            for field in [
-                    "input_lens", "output_lens", "ttfts", "itls",
-                    "generated_texts", "errors"
-            ]:
-                if field in result_json:
-                    del result_json[field]
-
+                
         # Traffic
         result_json["request_rate"] = (args.request_rate if args.request_rate
                                        < float("inf") else "inf")
@@ -701,6 +712,15 @@ def main(args: argparse.Namespace):
 
         # Merge with benchmark result
         result_json = {**result_json, **benchmark_result}
+
+        if not args.save_detailed:
+            # Remove fields with too many data points
+            for field in [
+                    "input_lens", "output_lens", "itls",
+                    "generated_texts", "errors"
+            ]:
+                if field in result_json:
+                    del result_json[field]
 
         # Save to file
         base_model_id = model_id.split("/")[-1]
@@ -713,7 +733,7 @@ def main(args: argparse.Namespace):
             file_name = os.path.join(args.result_dir, file_name)
         with open(file_name, "w", encoding='utf-8') as outfile:
             json.dump(result_json, outfile)
-        save_to_pytorch_benchmark_format(args, result_json, file_name)
+        # save_to_pytorch_benchmark_format(args, result_json, file_name)
 
 
 if __name__ == "__main__":
@@ -744,7 +764,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "leval"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -883,7 +903,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--metric-percentiles",
         type=str,
-        default="99",
+        default="10, 25, 75, 90",
         help="Comma-seperated list of percentiles for selected metrics. "
         "To report 25-th, 50-th, and 75-th percentiles, use \"25,50,75\". "
         "Default value is \"99\". "
@@ -949,10 +969,17 @@ if __name__ == "__main__":
         "Number of output tokens per request, used only for random sampling.",
     )
     random_group.add_argument(
-        "--random-range-ratio",
+        "--random-range-ratio-input",
         type=float,
         default=1.0,
-        help="Range of sampled ratio of input/output length, "
+        help="Range of sampled ratio of input length, "
+        "used only for random sampling.",
+    )
+    random_group.add_argument(
+        "--random-range-ratio-output",
+        type=float,
+        default=1.0,
+        help="Range of sampled ratio of output length, "
         "used only for random sampling.",
     )
     random_group.add_argument(

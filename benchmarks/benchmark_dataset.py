@@ -299,7 +299,8 @@ class RandomDataset(BenchmarkDataset):
         tokenizer: PreTrainedTokenizerBase,
         num_requests: int,
         prefix_len: int = DEFAULT_PREFIX_LEN,
-        range_ratio: float = DEFAULT_RANGE_RATIO,
+        range_ratio_input: float = DEFAULT_RANGE_RATIO,
+        range_ratio_output: float = DEFAULT_RANGE_RATIO,
         input_len: int = DEFAULT_INPUT_LEN,
         output_len: int = DEFAULT_OUTPUT_LEN,
         **kwargs,
@@ -309,8 +310,8 @@ class RandomDataset(BenchmarkDataset):
         prefix_token_ids = (np.random.randint(
             0, vocab_size, size=prefix_len).tolist() if prefix_len > 0 else [])
 
-        input_low = int(input_len * range_ratio)
-        output_low = int(output_len * range_ratio)
+        input_low = int(input_len * range_ratio_input)
+        output_low = int(output_len * range_ratio_output)
 
         input_lens = np.random.randint(input_low,
                                        input_len + 1,
@@ -322,19 +323,80 @@ class RandomDataset(BenchmarkDataset):
 
         requests = []
         for i in range(num_requests):
-            inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
+            target_input_len = input_lens[i]
+            inner_seq = ((offsets[i] + i + np.arange(int(target_input_len * 1.5))) %
                          vocab_size).tolist()
             token_sequence = prefix_token_ids + inner_seq
-            prompt = tokenizer.decode(token_sequence)
-            total_input_len = prefix_len + int(input_lens[i])
+            prompt_text = tokenizer.decode(token_sequence, skip_special_tokens=False)
+            actual_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
+            actual_len = len(actual_ids)
+
+            assert actual_len >= target_input_len
+            actual_ids = actual_ids[:target_input_len]
+            prompt_text = tokenizer.decode(actual_ids, skip_special_tokens=False)
+            actual_len = len(actual_ids)
+            assert actual_len == target_input_len
+
             requests.append(
                 SampleRequest(
-                    prompt=prompt,
-                    prompt_len=total_input_len,
+                    prompt=prompt_text,
+                    prompt_len=actual_len,
                     expected_output_len=int(output_lens[i]),
                 ))
         return requests
 
+class LEvalDataset(BenchmarkDataset):
+    def __init__(
+        self,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading data.")
+        with open(self.dataset_path, "r") as f:
+            prompts = json.load(f)
+
+        assert isinstance(prompts, list), "Expected prompts to be a list."
+        assert all(isinstance(p, str) for p in prompts), "Expected all prompts to be strings."
+
+        self.prompts = prompts
+
+    def sample(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        num_requests: int,
+        range_ratio_input: float,
+        range_ratio_output: float,
+        input_len: int,
+        output_len: int,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        requests = []
+
+        output_low = int(output_len * range_ratio_output)
+        input_low  = int(input_len * range_ratio_input)
+        
+        output_lens = np.random.randint(output_low,
+                                        output_len + 1,
+                                        size=num_requests)
+        
+        while len(requests) < num_requests:
+            prompt_idx = random.randint(0, len(self.prompts) - 1)
+            prompt     = self.prompts[prompt_idx]
+            prompt_len = len(tokenizer(prompt).input_ids)
+            if input_low <= prompt_len <= input_len:
+                requests.append(
+                    SampleRequest(
+                        prompt=prompt,
+                        prompt_len=prompt_len,
+                        expected_output_len=int(output_lens[len(requests)]),
+                    ))
+            else:
+                continue
+        return requests
 
 # -----------------------------------------------------------------------------
 # ShareGPT Dataset Implementation
